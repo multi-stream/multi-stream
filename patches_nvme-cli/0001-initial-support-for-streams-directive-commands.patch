@@ -1,0 +1,1154 @@
+From 3a0bb91d55af96c61fbc416c47dacdfe781bbee3 Mon Sep 17 00:00:00 2001
+From: "Kwan (Hingkwan) Huen-SSI" <kwan.huen@samsung.com>
+Date: Wed, 1 Feb 2017 18:38:40 -0800
+Subject: [PATCH] initial support for streams directive commands
+
+---
+ linux/nvme.h               |  11 ++
+ nvme-builtin.h             |   2 +
+ nvme-ioctl.c               |  40 +++++++
+ nvme-ioctl.h               |   5 +
+ nvme-print.c               |  82 +++++++++++++-
+ nvme-print.h               |   3 +
+ nvme.c                     | 275 ++++++++++++++++++++++++++++++++++++++++++++-
+ regress_directive          | 173 ++++++++++++++++++++++++++++
+ scripts/alloc_rsc.sh       |  15 +++
+ scripts/dir_cmd.sh         |  25 +++++
+ scripts/disable_str.sh     |  15 +++
+ scripts/enable_str.sh      |  15 +++
+ scripts/get_dir_param.sh   |  15 +++
+ scripts/get_str_param.sh   |  15 +++
+ scripts/get_str_status.sh  |  15 +++
+ scripts/latency.fio        |  22 ++++
+ scripts/release_rsc.sh     |  15 +++
+ scripts/release_strid.sh   |  15 +++
+ scripts/sf_multistream.fio |  47 ++++++++
+ scripts/str_rw.sh          |  36 ++++++
+ scripts/str_write.sh       |  18 +++
+ 21 files changed, 854 insertions(+), 5 deletions(-)
+ create mode 100755 regress_directive
+ create mode 100755 scripts/alloc_rsc.sh
+ create mode 100755 scripts/dir_cmd.sh
+ create mode 100755 scripts/disable_str.sh
+ create mode 100755 scripts/enable_str.sh
+ create mode 100755 scripts/get_dir_param.sh
+ create mode 100755 scripts/get_str_param.sh
+ create mode 100755 scripts/get_str_status.sh
+ create mode 100644 scripts/latency.fio
+ create mode 100755 scripts/release_rsc.sh
+ create mode 100755 scripts/release_strid.sh
+ create mode 100644 scripts/sf_multistream.fio
+ create mode 100755 scripts/str_rw.sh
+ create mode 100755 scripts/str_write.sh
+
+diff --git a/linux/nvme.h b/linux/nvme.h
+index 30a4c00..2090c1b 100644
+--- a/linux/nvme.h
++++ b/linux/nvme.h
+@@ -566,6 +566,8 @@ enum nvme_admin_opcode {
+ 	nvme_admin_download_fw		= 0x11,
+ 	nvme_admin_ns_attach		= 0x15,
+ 	nvme_admin_keep_alive		= 0x18,
++	nvme_admin_directive_send	= 0x19,
++	nvme_admin_directive_recv	= 0x1a,
+ 	nvme_admin_format_nvm		= 0x80,
+ 	nvme_admin_security_send	= 0x81,
+ 	nvme_admin_security_recv	= 0x82,
+@@ -604,6 +606,15 @@ enum {
+ 	NVME_FWACT_REPL		= (0 << 3),
+ 	NVME_FWACT_REPL_ACTV	= (1 << 3),
+ 	NVME_FWACT_ACTV		= (2 << 3),
++	NVME_DIR_IDENTIFY	= 0x00,
++	NVME_DIR_STREAMS	= 0x01,
++	NVME_DIR_ID_RCVOP_PARAM		= 0x01,
++	NVME_DIR_ID_SNDOP_ENABLE	= 0x01,
++	NVME_DIR_ST_RCVOP_PARAM		= 0x01,
++	NVME_DIR_ST_RCVOP_STATUS	= 0x02,
++	NVME_DIR_ST_RCVOP_RESOURCE	= 0x03,
++	NVME_DIR_ST_SNDOP_REL_ID	= 0x01,
++	NVME_DIR_ST_SNDOP_REL_RSC	= 0x02,
+ };
+ 
+ struct nvme_identify {
+diff --git a/nvme-builtin.h b/nvme-builtin.h
+index dc314cb..ab966e5 100644
+--- a/nvme-builtin.h
++++ b/nvme-builtin.h
+@@ -49,6 +49,8 @@ COMMAND_LIST(
+ 	ENTRY("connect-all", "Discover and Connect to NVMeoF subsystems", connect_all_cmd)
+ 	ENTRY("connect", "Connect to NVMeoF subsystem", connect_cmd)
+ 	ENTRY("disconnect", "Disconnect from NVMeoF subsystem", disconnect_cmd)
++	ENTRY("dir-receive", "Submit a Directive Receive command, return results", dir_receive)
++	ENTRY("dir-send", "Submit a Directive Send command, return results", dir_send)
+ );
+ 
+ #endif
+diff --git a/nvme-ioctl.c b/nvme-ioctl.c
+index 9df04ae..dc43758 100644
+--- a/nvme-ioctl.c
++++ b/nvme-ioctl.c
+@@ -579,3 +579,43 @@ int nvme_sec_recv(int fd, __u32 nsid, __u8 nssf, __u16 spsp,
+ 		*result = cmd.result;
+ 	return err;
+ }
++
++int nvme_dir_send(int fd, __u32 nsid, __u16 dspec, __u8 dtype, __u8 doper,
++		  __u32 data_len, __u32 dw12, void *data, __u32 *result)
++{
++	struct nvme_admin_cmd cmd = {
++		.opcode		= nvme_admin_directive_send,
++		.addr		= (__u64)(uintptr_t) data,
++		.data_len	= data_len,
++		.nsid		= nsid,
++		.cdw10		= data_len? (data_len >> 2) - 1 : 0,
++		.cdw11		= dspec << 16 | dtype << 8 | doper,
++		.cdw12		= dw12,
++	};
++	int err;
++
++	err = nvme_submit_admin_passthru(fd, &cmd);
++	if (!err && result)
++		*result = cmd.result;
++	return err;
++}
++
++int nvme_dir_recv(int fd, __u32 nsid, __u16 dspec, __u8 dtype, __u8 doper,
++		  __u32 data_len, __u32 dw12, void *data, __u32 *result)
++{
++	struct nvme_admin_cmd cmd = {
++		.opcode		= nvme_admin_directive_recv,
++		.addr		= (__u64)(uintptr_t) data,
++		.data_len	= data_len,
++		.nsid		= nsid,
++		.cdw10		= data_len? (data_len >> 2) - 1 : 0,
++		.cdw11		= dspec << 16 | dtype << 8 | doper,
++		.cdw12		= dw12,
++	};
++	int err;
++
++	err = nvme_submit_admin_passthru(fd, &cmd);
++	if (!err && result)
++		*result = cmd.result;
++	return err;
++}
+diff --git a/nvme-ioctl.h b/nvme-ioctl.h
+index 434b29e..cd573db 100644
+--- a/nvme-ioctl.h
++++ b/nvme-ioctl.h
+@@ -117,4 +117,9 @@ int nvme_sec_recv(int fd, __u32 nsid, __u8 nssf, __u16 spsp,
+ int nvme_subsystem_reset(int fd);
+ int nvme_reset_controller(int fd);
+ 
++int nvme_dir_send(int fd, __u32 nsid, __u16 dspec, __u8 dtype, __u8 doper,
++                  __u32 data_len, __u32 dw12, void *data, __u32 *result);
++int nvme_dir_recv(int fd, __u32 nsid, __u16 dspec, __u8 dtype, __u8 doper,
++                  __u32 data_len, __u32 dw12, void *data, __u32 *result);
++
+ #endif				/* _NVME_LIB_H */
+diff --git a/nvme-print.c b/nvme-print.c
+index 34c146d..53529df 100644
+--- a/nvme-print.c
++++ b/nvme-print.c
+@@ -109,14 +109,20 @@ static void show_nvme_id_ctrl_oaes(__le32 ctrl_oaes)
+ static void show_nvme_id_ctrl_oacs(__le16 ctrl_oacs)
+ {
+ 	__u16 oacs = le16_to_cpu(ctrl_oacs);
+-	__u16 rsvd = (oacs & 0xFFF0) >> 4;
++	__u16 rsvd = (oacs & 0xFFC0) >> 6;
++	__u16 dir = (oacs & 0x20) >> 5;
++	__u16 sft = (oacs & 0x10) >> 4;
+ 	__u16 nsm = (oacs & 0x8) >> 3;
+ 	__u16 fwc = (oacs & 0x4) >> 2;
+ 	__u16 fmt = (oacs & 0x2) >> 1;
+ 	__u16 sec = oacs & 0x1;
+ 
+ 	if (rsvd)
+-		printf(" [15:4] : %#x\tReserved\n", rsvd);
++		printf(" [15:6] : %#x\tReserved\n", rsvd);
++	printf("  [5:5] : %#x\tDirectives %sSupported\n",
++		dir, dir ? "" : "Not ");
++	printf("  [4:4] : %#x\tDevice Self-test %sSupported\n",
++		sft, sft ? "" : "Not ");
+ 	printf("  [3:3] : %#x\tNS Management and Attachment %sSupported\n",
+ 		nsm, nsm ? "" : "Not ");
+ 	printf("  [2:2] : %#x\tFW Commit and Download %sSupported\n",
+@@ -894,6 +900,27 @@ char* nvme_select_to_string(int sel)
+ 	}
+ }
+ 
++char* nvme_dtype_to_string(__u8 dtype)
++{
++	switch (dtype) {
++	case 0:  return "Current";
++	case 1:  return "Default";
++	case 2:  return "Saved";
++	case 3:  return "Supported capabilities";
++	default: return "Reserved";
++	}
++}
++
++char* nvme_doper_to_string(__u8 doper)
++{
++	switch (doper) {
++	case 0:  return "Current";
++	case 1:  return "Default";
++	case 2:  return "Saved";
++	case 3:  return "Supported capabilities";
++	default: return "Reserved";
++	}
++}
+ 
+ char *nvme_status_to_string(__u32 status)
+ {
+@@ -1048,6 +1075,57 @@ static void show_host_mem_buffer(struct nvme_host_mem_buffer *hmb)
+ 	printf("\tHost Memory Buffer Size                  (HSIZE): %u\n", hmb->hsize);
+ }
+ 
++void nvme_directive_show_fields(__u8 dtype, __u8 doper, unsigned int result, unsigned char *buf)
++{
++	__u8 *field = buf;
++	int count, i;
++        switch (dtype) {
++        case NVME_DIR_IDENTIFY:
++                switch (doper) {
++                case NVME_DIR_ID_RCVOP_PARAM:
++			printf("\tDirective support \n");
++			printf("\t\tStreams Directive   : %s\n", (*field & 0x1) ? "supported":"not supported");
++			printf("\t\tIdentify Directive  : %s\n", (*field & 0x2) ? "supported":"not supported");
++			printf("\tDirective status \n");
++			printf("\t\tStreams Directive   : %s\n", (*(field + 32) & 0x1) ? "enabled" : "disabled");
++			printf("\t\tIdentify Directive  : %s\n", (*(field + 32) & 0x2) ? "enabled" : "disabled");
++                        break;
++                default:
++                        fprintf(stderr, "invalid directive operations for Identify Directives\n");
++                }
++                break;
++        case NVME_DIR_STREAMS:
++                switch (doper) {
++                case NVME_DIR_ST_RCVOP_PARAM:
++			printf("\tMax Streams Limit                          (MSL): %u\n", *(__u16 *) field);
++			printf("\tNumber of NVM Subsystem Stream Resources (NNSSR): %u\n", *(__u16 *) (field + 2));
++			printf("\tNumber of Open Streams in NVM subsystem  (NOSNS): %u\n", *(__u16 *) (field + 4));
++			printf("\tOptimal Stream Write Size                 (OSWS): %u\n", *(__u32 *) (field + 16));
++			printf("\tStream Granularity Size                    (SGS): %u\n", *(__u16 *) (field + 20));
++			printf("\tAllocated Stream Resources                 (ASR): %u\n", *(__u16 *) (field + 22));
++			printf("\tNumber of Open Streams in Namespace       (NOSN): %u\n", *(__u16 *) (field + 24));
++                        break;
++                case NVME_DIR_ST_RCVOP_STATUS:
++			count = *(__u16 *) field;
++			printf("\tOpen Stream Count  : %u\n", *(__u16 *) field);
++			for ( i = 0; i < count; i++ ) {
++				printf("\tStream Identifier %.6u : %u\n", i + 1, *(__u16 *) (field + ((i + 1) * 2)));
++			}
++                        break;
++                case NVME_DIR_ST_RCVOP_RESOURCE:
++			printf("\tAllocated Stream Resource Count (ASR): %u\n", result & 0xffff);
++                        break;
++                default:
++                        fprintf(stderr, "invalid directive operations for Streams Directives\n");
++                }
++                break;
++        default:
++                fprintf(stderr, "invalid directive type\n");
++                break;
++        }
++        return;
++}
++
+ void nvme_feature_show_fields(__u32 fid, unsigned int result, unsigned char *buf)
+ {
+ 	__u8 field;
+diff --git a/nvme-print.h b/nvme-print.h
+index 93131c7..7b6278f 100644
+--- a/nvme-print.h
++++ b/nvme-print.h
+@@ -26,9 +26,12 @@ void show_smart_log(struct nvme_smart_log *smart, unsigned int nsid, const char
+ void show_fw_log(struct nvme_firmware_log_page *fw_log, const char *devname);
+ 
+ void nvme_feature_show_fields(__u32 fid, unsigned int result, unsigned char *buf);
++void nvme_directive_show_fields(__u8 dtype, __u8 doper, unsigned int result, unsigned char *buf);
+ char *nvme_status_to_string(__u32 status);
+ char *nvme_select_to_string(int sel);
+ char *nvme_feature_to_string(int feature);
++char *nvme_dtype_to_string(__u8 dtype);
++char *nvme_doper_to_string(__u8 doper);
+ 
+ void json_nvme_id_ctrl(struct nvme_id_ctrl *ctrl, unsigned int mode);
+ void json_nvme_id_ns(struct nvme_id_ns *ns, unsigned int flags);
+diff --git a/nvme.c b/nvme.c
+index a9e78aa..223311f 100644
+--- a/nvme.c
++++ b/nvme.c
+@@ -1146,6 +1146,127 @@ static int get_feature(int argc, char **argv, struct command *cmd, struct plugin
+ 	return err;
+ }
+ 
++static int dir_receive(int argc, char **argv, struct command *cmd, struct plugin *plugin)
++{
++	const char *desc = "Read directive parameters of the "\
++		"specified directive type.";
++	const char *raw_binary = "show infos in binary format";
++	const char *namespace_id = "identifier of desired namespace";
++	const char *data_len = "buffer len (if) data is returned";
++	const char *dtype = "directive type";
++	const char *dspec = "directive specification associated with directive type";
++	const char *doper = "directive operation";
++	const char *rsr = "requested stream resource";
++	const char *human_readable = "show infos in readable format";
++	int err;
++	__u32 result;
++	__u32 dw12 = 0;
++	void *buf = NULL;
++
++	struct config {
++		__u32 namespace_id;
++		__u32 data_len;
++		__u16 dspec;
++		__u8  dtype;
++		__u8  doper;
++		__u16 rsr; /* dw12 for NVME_DIR_ST_RCVOP_STATUS */
++		int  raw_binary;
++		int  human_readable;
++	};
++
++	struct config cfg = {
++		.namespace_id = 1,
++		.data_len     = 0,
++		.dspec        = 0,
++		.dtype        = 0,
++		.doper        = 0,
++		.rsr          = 0,
++	};
++
++	const struct argconfig_commandline_options command_line_options[] = {
++		{"namespace-id",   'n', "NUM", CFG_POSITIVE, &cfg.namespace_id,   required_argument, namespace_id},
++		{"data-len",       'l', "NUM", CFG_POSITIVE, &cfg.data_len,       required_argument, data_len},
++		{"raw-binary",     'b', "FLAG",CFG_NONE,     &cfg.raw_binary,     no_argument,       raw_binary},
++		{"dir-type",       'D', "NUM", CFG_BYTE,     &cfg.dtype,          required_argument, dtype},
++		{"dir-spec",       'S', "NUM", CFG_SHORT,    &cfg.dspec,          required_argument, dspec},
++		{"dir-oper",       'O', "NUM", CFG_BYTE,     &cfg.doper,          required_argument, doper},
++		{"req-resource",   'r', "NUM", CFG_SHORT,    &cfg.rsr,            required_argument, rsr},
++		{"human-readable", 'H', "FLAG",CFG_NONE,     &cfg.human_readable, no_argument,       human_readable},
++		{NULL}
++	};
++
++	parse_and_open(argc, argv, desc, command_line_options, &cfg, sizeof(cfg));
++
++	switch (cfg.dtype) {
++	case NVME_DIR_IDENTIFY:
++		switch (cfg.doper) {
++		case NVME_DIR_ID_RCVOP_PARAM:
++			cfg.data_len = 4096;
++			break;
++		default:
++			fprintf(stderr, "invalid directive operations for Identify Directives\n");
++			return EINVAL;
++		}
++		break;
++	case NVME_DIR_STREAMS:
++		switch (cfg.doper) {
++		case NVME_DIR_ST_RCVOP_PARAM:
++			cfg.data_len = 32;
++			break;
++		case NVME_DIR_ST_RCVOP_STATUS:
++			cfg.data_len = 128 * 1024;
++			break;
++		case NVME_DIR_ST_RCVOP_RESOURCE:
++			dw12 = cfg.rsr;
++			break;
++		default:
++			fprintf(stderr, "invalid directive operations for Streams Directives\n");
++			return EINVAL;
++		}
++		break;
++	default:
++		fprintf(stderr, "invalid directive type\n");
++		return EINVAL;
++		break;
++	}
++
++	if (cfg.data_len) {
++		if (posix_memalign(&buf, getpagesize(), cfg.data_len))
++			exit(ENOMEM);
++		memset(buf, 0, cfg.data_len);
++	}
++
++	err = nvme_dir_recv(fd, cfg.namespace_id, cfg.dspec, cfg.dtype, cfg.doper,
++			cfg.data_len, dw12, buf, &result);
++        if (err < 0) {
++                perror("dir-receive");
++                return errno;
++        }
++
++	if (!err) {
++		printf("dir-receive: type %#02x (%s), operation %#02x (%s), spec %#04x, result %#04x \n",
++				cfg.dtype, nvme_dtype_to_string(cfg.dtype),
++				cfg.doper, nvme_doper_to_string(cfg.doper),
++				cfg.dspec, result);
++		if (cfg.human_readable)
++			nvme_directive_show_fields(cfg.dtype, cfg.doper, result, buf);
++		else {
++			if (buf) {
++				if (!cfg.raw_binary)
++					d(buf, cfg.data_len, 16, 1);
++				else
++					d_raw(buf, cfg.data_len);
++			}
++		}
++	}
++	else if (err > 0)
++		fprintf(stderr, "NVMe Status:%s(%x)\n",
++				nvme_status_to_string(err), err);
++	if (buf)
++		free(buf);
++	return err;
++}
++
+ static int fw_download(int argc, char **argv, struct command *cmd, struct plugin *plugin)
+ {
+ 	const char *desc = "Copy all or part of a firmware image to "\
+@@ -1636,6 +1757,143 @@ static int set_feature(int argc, char **argv, struct command *cmd, struct plugin
+ 	return err;
+ }
+ 
++static int dir_send(int argc, char **argv, struct command *cmd, struct plugin *plugin)
++{
++        const char *desc = "Set directive parameters of the "\
++                "specified directive type.";
++        const char *raw_binary = "show infos in binary format";
++        const char *namespace_id = "identifier of desired namespace";
++        const char *data_len = "buffer len (if) data is returned";
++        const char *dtype = "directive type";
++        const char *dspec = "directive specification associated with directive type";
++        const char *doper = "directive operation";
++        const char *endir = "directive enable";
++        const char *ttype = "target directive type to be enabled/disabled";
++        const char *human_readable = "show infos in readable format";
++        int err;
++        __u32 result;
++        __u32 dw12 = 0;
++        void *buf = NULL;
++	int ffd = STDIN_FILENO;
++
++        struct config {
++		char *file;
++                __u32 namespace_id;
++                __u32 data_len;
++                __u16 dspec;
++                __u8  dtype;
++                __u8  doper;
++                __u16 endir;
++                __u8  ttype;
++                int  raw_binary;
++                int  human_readable;
++        };
++
++        struct config cfg = {
++		.file         = "",
++                .namespace_id = 1,
++                .data_len     = 0,
++                .dspec        = 0,
++                .dtype        = 0,
++                .ttype        = 0,
++                .doper        = 0,
++                .endir        = 1,
++        };
++
++        const struct argconfig_commandline_options command_line_options[] = {
++                {"namespace-id",   'n', "NUM", CFG_POSITIVE, &cfg.namespace_id,   required_argument, namespace_id},
++                {"data-len",       'l', "NUM", CFG_POSITIVE, &cfg.data_len,       required_argument, data_len},
++                {"raw-binary",     'b', "FLAG",CFG_NONE,     &cfg.raw_binary,     no_argument,       raw_binary},
++                {"dir-type",       'D', "NUM", CFG_BYTE,     &cfg.dtype,          required_argument, dtype},
++                {"target-dir",     'T', "NUM", CFG_BYTE,     &cfg.ttype,          required_argument, ttype},
++                {"dir-spec",       'S', "NUM", CFG_SHORT,    &cfg.dspec,          required_argument, dspec},
++                {"dir-oper",       'O', "NUM", CFG_BYTE,     &cfg.doper,          required_argument, doper},
++                {"endir",          'e', "NUM", CFG_SHORT,    &cfg.endir,          required_argument, endir},
++                {"human-readable", 'H', "FLAG",CFG_NONE,     &cfg.human_readable, no_argument,       human_readable},
++                {NULL}
++        };
++
++	parse_and_open(argc, argv, desc, command_line_options, &cfg, sizeof(cfg));
++
++	switch (cfg.dtype) {
++        case NVME_DIR_IDENTIFY:
++                switch (cfg.doper) {
++                case NVME_DIR_ID_SNDOP_ENABLE:
++			if (!cfg.ttype) {
++				fprintf(stderr, "target-dir required param\n");
++				return EINVAL;
++			}
++			dw12 = cfg.ttype << 8 | cfg.endir;
++                        break;
++                default:
++                        fprintf(stderr, "invalid directive operations for Identify Directives\n");
++                        return EINVAL;
++                }
++                break;
++        case NVME_DIR_STREAMS:
++                switch (cfg.doper) {
++                case NVME_DIR_ST_SNDOP_REL_ID:
++                case NVME_DIR_ST_SNDOP_REL_RSC:
++                        break;
++                default:
++                        fprintf(stderr, "invalid directive operations for Streams Directives\n");
++                        return EINVAL;
++                }
++                break;
++        default:
++                fprintf(stderr, "invalid directive type\n");
++                return EINVAL;
++                break;
++        }
++
++
++	if (cfg.data_len) {
++		if (posix_memalign(&buf, getpagesize(), cfg.data_len))
++			exit(ENOMEM);
++		memset(buf, 0, cfg.data_len);
++	}
++
++	if (buf) {
++		if (strlen(cfg.file)) {
++			ffd = open(cfg.file, O_RDONLY);
++			if (ffd <= 0) {
++				fprintf(stderr, "no firmware file provided\n");
++				return -EINVAL;
++			}
++		}
++		if (read(ffd, (void *)buf, cfg.data_len) < 0) {
++			fprintf(stderr, "failed to read data buffer from input file\n");
++			return EINVAL;
++		}
++	}
++
++	err = nvme_dir_send(fd, cfg.namespace_id, cfg.dspec, cfg.dtype, cfg.doper,
++				cfg.data_len, dw12, buf, &result);
++	if (err < 0) {
++		perror("dir-send");
++		return errno;
++	}
++	if (!err) {
++		printf("dir-send: type %#02x (%s), operation %#02x (%s), spec_val %#04x, result %#04x \n",
++                                cfg.dtype, nvme_dtype_to_string(cfg.dtype),
++                                cfg.doper, nvme_doper_to_string(cfg.doper),
++                                cfg.dspec, result);
++		if (buf) {
++			if (!cfg.raw_binary)
++				d(buf, cfg.data_len, 16, 1);
++			else
++				d_raw(buf, cfg.data_len);
++		}
++	}
++	else if (err > 0)
++		fprintf(stderr, "NVMe Status:%s(%x)\n",
++				nvme_status_to_string(err), err);
++	if (buf)
++		free(buf);
++	return err;
++}
++
++
+ static int sec_send(int argc, char **argv, struct command *cmd, struct plugin *plugin)
+ {
+ 	struct stat sb;
+@@ -2224,6 +2482,7 @@ static int submit_io(int opcode, char *command, const char *desc,
+ 	int flags = opcode & 1 ? O_RDONLY : O_WRONLY | O_CREAT;
+ 	int mode = S_IRUSR | S_IWUSR |S_IRGRP | S_IWGRP| S_IROTH;
+ 	__u16 control = 0;
++	__u32 dsmgmt = 0;
+ 	int phys_sector_size = 0;
+ 	long long buffer_size = 0;
+ 
+@@ -2242,6 +2501,8 @@ static int submit_io(int opcode, char *command, const char *desc,
+ 	const char *force = "force device to commit data before command completes";
+ 	const char *show = "show command before sending";
+ 	const char *dry = "show command instead of sending";
++	const char *dtype = "directive type";
++	const char *dspec = "directive specfic value associated with directive type";
+ 
+ 	struct config {
+ 		__u64 start_block;
+@@ -2256,6 +2517,8 @@ static int submit_io(int opcode, char *command, const char *desc,
+ 		__u32 app_tag;
+ 		int   limited_retry;
+ 		int   force_unit_access;
++		__u8  dtype;
++		__u16 dspec;
+ 		int   show;
+ 		int   dry_run;
+ 		int   latency;
+@@ -2272,6 +2535,8 @@ static int submit_io(int opcode, char *command, const char *desc,
+ 		.prinfo          = 0,
+ 		.app_tag_mask    = 0,
+ 		.app_tag         = 0,
++		.dtype           = 0,
++		.dspec           = 0,
+ 	};
+ 
+ 	const struct argconfig_commandline_options command_line_options[] = {
+@@ -2287,6 +2552,9 @@ static int submit_io(int opcode, char *command, const char *desc,
+ 		{"app-tag",           'a', "NUM",  CFG_POSITIVE,    &cfg.app_tag,           required_argument, app_tag},
+ 		{"limited-retry",     'l', "",     CFG_NONE,        &cfg.limited_retry,     no_argument,       limited_retry},
+ 		{"force-unit-access", 'f', "",     CFG_NONE,        &cfg.force_unit_access, no_argument,       force},
++		{"dir-type",          'D', "NUM",  CFG_BYTE,        &cfg.dtype,             required_argument, dtype},
++		{"dir-spec",          'S', "NUM",  CFG_SHORT,       &cfg.dspec,             required_argument, dspec},
++		{"force-unit-access", 'f', "",     CFG_NONE,        &cfg.force_unit_access, no_argument,       force},
+ 		{"show-command",      'v', "",     CFG_NONE,        &cfg.show,              no_argument,       show},
+ 		{"dry-run",           'w', "",     CFG_NONE,        &cfg.dry_run,           no_argument,       dry},
+ 		{"latency",           't', "",     CFG_NONE,        &cfg.latency,           no_argument,       latency},
+@@ -2298,7 +2566,8 @@ static int submit_io(int opcode, char *command, const char *desc,
+ 	dfd = mfd = opcode & 1 ? STDIN_FILENO : STDOUT_FILENO;
+ 	if (cfg.prinfo > 0xf)
+ 		return EINVAL;
+-	control |= (cfg.prinfo << 10);
++	dsmgmt |= (cfg.dspec << 16);
++	control |= ((cfg.prinfo << 10) | (cfg.dtype << 4));
+ 	if (cfg.limited_retry)
+ 		control |= NVME_RW_LR;
+ 	if (cfg.force_unit_access)
+@@ -2369,7 +2638,7 @@ static int submit_io(int opcode, char *command, const char *desc,
+ 		printf("metadata     : %"PRIx64"\n", (uint64_t)(uintptr_t)mbuffer);
+ 		printf("addr         : %"PRIx64"\n", (uint64_t)(uintptr_t)buffer);
+ 		printf("sbla         : %"PRIx64"\n", (uint64_t)cfg.start_block);
+-		printf("dsmgmt       : %08x\n", 0);
++		printf("dsmgmt       : %08x\n", dsmgmt);
+ 		printf("reftag       : %08x\n", cfg.ref_tag);
+ 		printf("apptag       : %04x\n", cfg.app_tag);
+ 		printf("appmask      : %04x\n", cfg.app_tag_mask);
+@@ -2378,7 +2647,7 @@ static int submit_io(int opcode, char *command, const char *desc,
+ 	}
+ 
+ 	gettimeofday(&start_time, NULL);
+-	err = nvme_io(fd, opcode, cfg.start_block, cfg.block_count, control, 0,
++	err = nvme_io(fd, opcode, cfg.start_block, cfg.block_count, control, dsmgmt,
+ 			cfg.ref_tag, cfg.app_tag, cfg.app_tag_mask, buffer, mbuffer);
+ 	gettimeofday(&end_time, NULL);
+ 	if (cfg.latency)
+diff --git a/regress_directive b/regress_directive
+new file mode 100755
+index 0000000..e1abdde
+--- /dev/null
++++ b/regress_directive
+@@ -0,0 +1,173 @@
++#!/bin/bash
++#
++# Copyright 2016 Samsung Semiconductor, Inc.
++#
++# This program is free software; you can redistribute it and/or
++# modify it under the terms of the GNU General Public License
++# as published by the Free Software Foundation; either version 2
++# of the License, or (at your option) any later version.
++#
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program; if not, write to the Free Software
++# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
++# MA  02110-1301, USA.
++#
++#   Description:
++#     Regression test-suite for the NVM Express CLI.
++#
++
++DEVICE=
++WRITE=false
++LIST=false
++
++RAND_BASE=temp.rand
++RAND_WFILE=${RAND_BASE}.write
++RAND_RFILE=${RAND_BASE}.read
++RAND_SIZE=4096
++RAND_BLK=`echo "${RAND_SIZE} / 512 - 1" | bc`
++
++green=$(tput bold)$(tput setaf 2)
++red=$(tput bold)$(tput setaf 1)
++rst=$(tput sgr0)
++
++while getopts ":d:wl" opt; do
++  case $opt in
++    d)
++      DEVICE=${OPTARG}
++      ;;
++    w)
++      echo "WARNING: Write mode enabled, this might trash your drive!"
++      WRITE=true
++      ;;
++    l)
++      LIST=true
++      ;;
++    \?)
++      echo "Invalid option: -$OPTARG" >&2
++      exit 1
++      ;;
++    :)
++      echo "Option -$OPTARG requires an argument." >&2
++      exit 1
++      ;;
++  esac
++done
++
++if [ -z "$DEVICE" ]; then
++     echo "regress: You must specify a NVMe device using -d"
++     exit 1
++fi
++
++function print_pass_fail {
++    $* > /dev/null 2>&1
++    if (( $? )); then
++        echo ${red}"FAILED!"${rst}
++        echo "Failed running command: "
++        echo  "   $*"
++        exit 1
++    else
++        echo ${green}"PASSED!"${rst}
++    fi
++}
++
++function run_test {
++    LINE="$*"
++    printf  "  %-3s   %-130s : " "RUN" "${LINE::130}"
++    print_pass_fail $*
++}
++
++make clean > /dev/null || exit -1
++make install > /dev/null || exit -1
++
++echo "regular commands ..."
++if $LIST ; then
++    run_test nvme list
++fi
++run_test nvme id-ctrl ${DEVICE}
++run_test nvme id-ns -raw-binary ${DEVICE}
++run_test nvme list-ns -n 1 ${DEVICE}
++run_test nvme get-ns-id ${DEVICE}
++run_test nvme get-log ${DEVICE}  --log-id=2 --log-len=512
++run_test nvme fw-log ${DEVICE}
++run_test nvme fw-log ${DEVICE} -b
++run_test nvme smart-log ${DEVICE}
++run_test nvme error-log ${DEVICE}
++run_test nvme get-feature ${DEVICE} -f 7
++run_test nvme flush ${DEVICE}
++
++if $WRITE ; then
++    run_test dd if=/dev/urandom of=${RAND_WFILE} bs=${RAND_SIZE} count=1
++    run_test nvme write ${DEVICE} --start-block=0 --block-count=${RAND_BLK} --data-size=${RAND_SIZE} --data ${RAND_WFILE}
++fi
++run_test nvme read ${DEVICE} --start-block=0 --block-count=${RAND_BLK} --data-size=${RAND_SIZE} --data ${RAND_RFILE} --latency
++if $WRITE ; then
++    run_test diff ${RAND_RFILE} ${RAND_WFILE}
++    rm ${RAND_WFILE} > /dev/null
++fi
++rm ${RAND_RFILE} > /dev/null
++
++echo " "
++echo "directive commands ..."
++#echo "directive param ..."
++run_test nvme dir-receive ${DEVICE} --dir-type 0 --dir-oper 1
++
++#echo "enable directive ..."
++run_test nvme dir-send ${DEVICE} --endir 1 --dir-type 0 --dir-oper 1 --target-dir 1
++
++#echo "stream param ..."
++run_test nvme dir-receive ${DEVICE} --dir-type 1 --dir-oper 1
++
++#echo "stream status ..."
++run_test nvme dir-receive ${DEVICE} --dir-type 1 --dir-oper 2
++
++#echo "release resource ..."
++run_test nvme dir-send ${DEVICE} --dir-type 1 --dir-oper 2
++
++#echo "allocate stream resource ..."
++run_test nvme dir-receive ${DEVICE} --dir-type 1 --dir-oper 3 --req-resource 4
++
++#echo "directive write ..."
++if $WRITE ; then
++    run_test dd if=/dev/urandom of=${RAND_WFILE} bs=${RAND_SIZE} count=1
++    run_test nvme write ${DEVICE} --start-block=0x0 --block-count=${RAND_BLK} --data-size=${RAND_SIZE} --data ${RAND_WFILE} --dir-type 1 --dir-spec 0
++    run_test nvme write ${DEVICE} --start-block=0x2000 --block-count=${RAND_BLK} --data-size=${RAND_SIZE} --data ${RAND_WFILE} --dir-type 1 --dir-spec 1
++    run_test nvme write ${DEVICE} --start-block=0x4000 --block-count=${RAND_BLK} --data-size=${RAND_SIZE} --data ${RAND_WFILE} --dir-type 1 --dir-spec 2
++    run_test nvme write ${DEVICE} --start-block=0x6000 --block-count=${RAND_BLK} --data-size=${RAND_SIZE} --data ${RAND_WFILE} --dir-type 1 --dir-spec 3
++    run_test nvme write ${DEVICE} --start-block=0x8000 --block-count=${RAND_BLK} --data-size=${RAND_SIZE} --data ${RAND_WFILE} --dir-type 1 --dir-spec 4
++    run_test nvme compare ${DEVICE} --start-block=0x0 --block-count=${RAND_BLK} --data-size=${RAND_SIZE} --data ${RAND_WFILE}
++    run_test nvme compare ${DEVICE} --start-block=0x2000 --block-count=${RAND_BLK} --data-size=${RAND_SIZE} --data ${RAND_WFILE}
++    run_test nvme compare ${DEVICE} --start-block=0x4000 --block-count=${RAND_BLK} --data-size=${RAND_SIZE} --data ${RAND_WFILE}
++    run_test nvme compare ${DEVICE} --start-block=0x6000 --block-count=${RAND_BLK} --data-size=${RAND_SIZE} --data ${RAND_WFILE}
++    run_test nvme compare ${DEVICE} --start-block=0x8000 --block-count=${RAND_BLK} --data-size=${RAND_SIZE} --data ${RAND_WFILE}
++    rm ${RAND_WFILE} > /dev/null
++fi
++
++#echo "release stream ..."
++run_test nvme dir-send ${DEVICE} --dir-type 1 --dir-oper 1 --dir-spec 1
++run_test nvme dir-send ${DEVICE} --dir-type 1 --dir-oper 1 --dir-spec 2
++run_test nvme dir-send ${DEVICE} --dir-type 1 --dir-oper 1 --dir-spec 3
++run_test nvme dir-send ${DEVICE} --dir-type 1 --dir-oper 1 --dir-spec 4
++
++if $WRITE ; then
++    run_test dd if=/dev/urandom of=${RAND_WFILE} bs=${RAND_SIZE} count=1
++    run_test nvme write ${DEVICE} --start-block=0x2000 --block-count=${RAND_BLK} --data-size=${RAND_SIZE} --data ${RAND_WFILE} --dir-type 1 --dir-spec 1
++    run_test nvme write ${DEVICE} --start-block=0x4000 --block-count=${RAND_BLK} --data-size=${RAND_SIZE} --data ${RAND_WFILE} --dir-type 1 --dir-spec 2
++    run_test nvme write ${DEVICE} --start-block=0x6000 --block-count=${RAND_BLK} --data-size=${RAND_SIZE} --data ${RAND_WFILE} --dir-type 1 --dir-spec 3
++    run_test nvme write ${DEVICE} --start-block=0x8000 --block-count=${RAND_BLK} --data-size=${RAND_SIZE} --data ${RAND_WFILE} --dir-type 1 --dir-spec 4
++    run_test nvme compare ${DEVICE} --start-block=0x2000 --block-count=${RAND_BLK} --data-size=${RAND_SIZE} --data ${RAND_WFILE}
++    run_test nvme compare ${DEVICE} --start-block=0x4000 --block-count=${RAND_BLK} --data-size=${RAND_SIZE} --data ${RAND_WFILE}
++    run_test nvme compare ${DEVICE} --start-block=0x6000 --block-count=${RAND_BLK} --data-size=${RAND_SIZE} --data ${RAND_WFILE}
++    run_test nvme compare ${DEVICE} --start-block=0x8000 --block-count=${RAND_BLK} --data-size=${RAND_SIZE} --data ${RAND_WFILE}
++    rm ${RAND_WFILE} > /dev/null
++fi
++
++#echo "release resource ..."
++run_test nvme dir-send ${DEVICE} --dir-type 1 --dir-oper 2
++
++#echo "disable directive ..."
++run_test nvme dir-send ${DEVICE} --endir 0 --dir-type 0 --dir-oper 1 --target-dir 1
+diff --git a/scripts/alloc_rsc.sh b/scripts/alloc_rsc.sh
+new file mode 100755
+index 0000000..26ea2d4
+--- /dev/null
++++ b/scripts/alloc_rsc.sh
+@@ -0,0 +1,15 @@
++#!/bin/bash
++if [ $# -lt 2 ]; then
++   tput bold
++   echo "***************************************************"
++   echo "FAILED to perform the requested operation.........."
++   echo "***************************************************"
++   tput sgr0
++   echo "Usage $0 <dev_handle> <stream_count>"
++   exit 1
++fi
++
++# allocate stream resource
++CMDLINE="sudo nvme dir-receive ${1} --dir-type 1 --dir-oper 3 --req-resource ${2} --human-readable"
++echo $CMDLINE
++exec $CMDLINE
+diff --git a/scripts/dir_cmd.sh b/scripts/dir_cmd.sh
+new file mode 100755
+index 0000000..96d6162
+--- /dev/null
++++ b/scripts/dir_cmd.sh
+@@ -0,0 +1,25 @@
++#!/bin/bash
++### enable directive type 1 (Streams)
++CMDLINE="sudo nvme dir-send /dev/nvme1n1 --dir-type 0 --dir-oper 1 --target-dir 1 --endir 1"
++echo $CMDLINE
++exec $CMDLINE
++
++### read directive type 0 (Identify)
++CMDLINE="sudo nvme dir-receive /dev/nvme1n1 --dir-type 0 --dir-oper 1"
++echo $CMDLINE
++exec $CMDLINE
++
++### disable directive type 1 (Streams)
++CMDLINE="sudo nvme dir-send /dev/nvme1n1 --dir-type 0 --dir-oper 1 --target-dir 1 --endir 0"
++echo $CMDLINE
++exec $CMDLINE
++
++### read directive type 0 (Identify)
++CMDLINE="sudo nvme dir-receive /dev/nvme1n1 --dir-type 0 --dir-oper 1"
++echo $CMDLINE
++exec $CMDLINE
++
++### read directive type 0 (Identify)
++CMDLINE="sudo nvme dir-receive /dev/nvme1n1 --dir-type 0 --dir-oper 1"
++echo $CMDLINE
++exec $CMDLINE
+diff --git a/scripts/disable_str.sh b/scripts/disable_str.sh
+new file mode 100755
+index 0000000..4eddff5
+--- /dev/null
++++ b/scripts/disable_str.sh
+@@ -0,0 +1,15 @@
++#!/bin/bash
++if [ $# -lt 1 ]; then
++   tput bold
++   echo "***************************************************"
++   echo "FAILED to perform the requested operation.........."
++   echo "***************************************************"
++   tput sgr0
++   echo "Usage $0 <dev_handle>"
++   exit 1
++fi
++
++### disable directive type 1 (Streams)
++CMDLINE="sudo nvme dir-send ${1} --dir-type 0 --dir-oper 1 --target-dir 1 --endir 0"
++echo $CMDLINE
++exec $CMDLINE
+diff --git a/scripts/enable_str.sh b/scripts/enable_str.sh
+new file mode 100755
+index 0000000..55c1c0d
+--- /dev/null
++++ b/scripts/enable_str.sh
+@@ -0,0 +1,15 @@
++#!/bin/bash
++if [ $# -lt 1 ]; then
++   tput bold
++   echo "***************************************************"
++   echo "FAILED to perform the requested operation.........."
++   echo "***************************************************"
++   tput sgr0
++   echo "Usage $0 <dev_handle>"
++   exit 1
++fi
++
++### enable directive type 1 (Streams)
++CMDLINE="sudo nvme dir-send ${1} --dir-type 0 --dir-oper 1 --target-dir 1 --endir 1"
++echo $CMDLINE
++exec $CMDLINE
+diff --git a/scripts/get_dir_param.sh b/scripts/get_dir_param.sh
+new file mode 100755
+index 0000000..ee2e878
+--- /dev/null
++++ b/scripts/get_dir_param.sh
+@@ -0,0 +1,15 @@
++#!/bin/bash
++if [ $# -lt 1 ]; then
++   tput bold
++   echo "***************************************************"
++   echo "FAILED to perform the requested operation.........."
++   echo "***************************************************"
++   tput sgr0
++   echo "Usage $0 <dev_handle>"
++   exit 1
++fi
++
++### get directive parameters for all supported directives
++CMDLINE="sudo nvme dir-receive ${1} --dir-type 0 --dir-oper 1 --human-readable"
++echo $CMDLINE
++exec $CMDLINE | more
+diff --git a/scripts/get_str_param.sh b/scripts/get_str_param.sh
+new file mode 100755
+index 0000000..f3520d6
+--- /dev/null
++++ b/scripts/get_str_param.sh
+@@ -0,0 +1,15 @@
++#!/bin/bash
++if [ $# -lt 1 ]; then
++   tput bold
++   echo "***************************************************"
++   echo "FAILED to perform the requested operation.........."
++   echo "***************************************************"
++   tput sgr0
++   echo "Usage $0 <dev_handle>"
++   exit 1
++fi
++
++### get streams directive parameters
++CMDLINE="sudo nvme dir-receive ${1} --dir-type 1 --dir-oper 1 --human-readable"
++echo $CMDLINE
++exec $CMDLINE
+diff --git a/scripts/get_str_status.sh b/scripts/get_str_status.sh
+new file mode 100755
+index 0000000..3b8fde2
+--- /dev/null
++++ b/scripts/get_str_status.sh
+@@ -0,0 +1,15 @@
++#!/bin/bash
++if [ $# -lt 1 ]; then
++   tput bold
++   echo "***************************************************"
++   echo "FAILED to perform the requested operation.........."
++   echo "***************************************************"
++   tput sgr0
++   echo "Usage $0 <dev_handle>"
++   exit 1
++fi
++
++### get streams directive status
++CMDLINE="sudo nvme dir-receive ${1} --dir-type 1 --dir-oper 2 --human-readable"
++echo $CMDLINE
++exec $CMDLINE
+diff --git a/scripts/latency.fio b/scripts/latency.fio
+new file mode 100644
+index 0000000..357484d
+--- /dev/null
++++ b/scripts/latency.fio
+@@ -0,0 +1,22 @@
++[global]
++rw=randread
++blocksize=4096
++ioengine=sync
++norandommap=1
++direct=1
++iodepth=1
++iodepth_batch=1
++iodepth_batch_complete=1
++group_reporting=1
++ramp_time=5
++time_based=1
++runtime=600s
++randrepeat=0
++unlink=0
++numjobs=1
++nrfiles=4
++size=100g
++
++[job1]
++filename=/dev/nvme1n1
++#directory=/home/kwan/mnt/
+diff --git a/scripts/release_rsc.sh b/scripts/release_rsc.sh
+new file mode 100755
+index 0000000..53c7805
+--- /dev/null
++++ b/scripts/release_rsc.sh
+@@ -0,0 +1,15 @@
++#!/bin/bash
++if [ $# -lt 1 ]; then
++   tput bold
++   echo "***************************************************"
++   echo "FAILED to perform the requested operation.........."
++   echo "***************************************************"
++   tput sgr0
++   echo "Usage $0 <dev_handle>"
++   exit 1
++fi
++
++### release all allocated streams resource(s)
++CMDLINE="sudo nvme dir-send ${1} --dir-type 1 --dir-oper 2"
++echo $CMDLINE
++exec $CMDLINE
+diff --git a/scripts/release_strid.sh b/scripts/release_strid.sh
+new file mode 100755
+index 0000000..fac35f3
+--- /dev/null
++++ b/scripts/release_strid.sh
+@@ -0,0 +1,15 @@
++#!/bin/bash
++if [ $# -lt 2 ]; then
++   tput bold
++   echo "***************************************************"
++   echo "FAILED to perform the requested operation.........."
++   echo "***************************************************"
++   tput sgr0
++   echo "Usage $0 <dev_handle> <stream_id>"
++   exit 1
++fi
++
++### enable directive type 1 (Streams)
++CMDLINE="sudo nvme dir-send ${1} --dir-type 1 --dir-oper 1 --dir-spec ${2}"
++echo $CMDLINE
++exec $CMDLINE
+diff --git a/scripts/sf_multistream.fio b/scripts/sf_multistream.fio
+new file mode 100644
+index 0000000..45f7e4b
+--- /dev/null
++++ b/scripts/sf_multistream.fio
+@@ -0,0 +1,47 @@
++ ;-- start job file --
++[global]
++filename=/dev/nvme1n1
++#directory=/home/kwan/mnt/
++direct=1
++#buffered=1
++iodepth=1
++#ioengine=mmap
++ioengine=libaio
++#ioengine=psync
++#ioengine=posixaio
++time_based
++file_service_type=random
++runtime=60
++group_reporting
++
++#[read]
++#bs=4k
++#rw=randread
++
++[job1]
++#rate=,50M
++#size=5%
++bs=4k
++rw=randwrite
++fadvise_stream=1
++
++[job2]
++#rate=,100M
++#size=10%
++bs=16k
++rw=randwrite
++fadvise_stream=2
++
++[job3]
++#rate=,200M
++#size=35%
++bs=128k
++rw=randwrite
++fadvise_stream=3
++
++[job4]
++#rate=,300M
++#size=50%
++bs=512k
++rw=randwrite
++fadvise_stream=4
+diff --git a/scripts/str_rw.sh b/scripts/str_rw.sh
+new file mode 100755
+index 0000000..cd40426
+--- /dev/null
++++ b/scripts/str_rw.sh
+@@ -0,0 +1,36 @@
++#!/bin/bash
++if [ $# -lt 2 ]; then
++   tput bold
++   echo "***************************************************"
++   echo "FAILED to perform the requested operation.........."
++   echo "***************************************************"
++   tput sgr0
++   echo "Usage $0 <dev_handle> <stream_id>"
++   exit 1
++fi
++
++DSIZE=`echo "4 * 1024" | bc`
++BSIZE=`echo "${DSIZE} / 512 - 1" | bc`
++
++sudo rm -rf ./sendfile.bin && sudo dd if=/dev/urandom of=./sendfile.bin bs=4k count=1 oflag=direct
++sudo dd if=/dev/zero of=${1} bs=4k count=1 oflag=direct skip=512
++echo "Stream write ..."
++CMDLINE="sudo nvme write ${1} --start-block=0x200 --block-count=${BSIZE} --data-size=${DSIZE} \
++ --data ./sendfile.bin --dir-type 1 --dir-spec ${2}"
++echo $CMDLINE
++$CMDLINE
++CMDLINE="sudo nvme compare ${1} --start-block=0x200 --block-count=${BSIZE} --data-size=${DSIZE} --data ./sendfile.bin"
++echo $CMDLINE
++$CMDLINE
++
++sudo rm -rf ./sendfile.bin && sudo dd if=/dev/urandom of=./sendfile.bin bs=4k count=1 oflag=direct
++sudo dd if=/dev/zero of=${1} bs=4k count=1 oflag=direct skip=512
++echo "Regular write ..."
++CMDLINE="sudo nvme write ${1} --start-block=0x200 --block-count=${BSIZE} --data-size=${DSIZE} --data ./sendfile.bin"
++echo $CMDLINE
++$CMDLINE
++CMDLINE="sudo nvme compare ${1} --start-block=0x200 --block-count=${BSIZE} --data-size=${DSIZE} --data ./sendfile.bin"
++echo $CMDLINE
++$CMDLINE
++
++sudo rm -rf ./sendfile.bin
+diff --git a/scripts/str_write.sh b/scripts/str_write.sh
+new file mode 100755
+index 0000000..c336c46
+--- /dev/null
++++ b/scripts/str_write.sh
+@@ -0,0 +1,18 @@
++#!/bin/bash
++if [ $# -lt 2 ]; then
++   tput bold
++   echo "***************************************************"
++   echo "FAILED to perform the requested operation.........."
++   echo "***************************************************"
++   tput sgr0
++   echo "Usage $0 <dev_handle> <stream_id>"
++   exit 1
++fi
++
++DSIZE=4096
++BSIZE=`echo "${DSIZE}/512-1"|bc`
++
++CMDLINE="sudo nvme write ${1} --start-block=0x200 --block-count=${BSIZE} --data-size=${DSIZE} --data /dev/urandom \
++ --dir-type 1 --dir-spec ${2}"
++echo $CMDLINE
++exec $CMDLINE
+-- 
+2.7.4
+

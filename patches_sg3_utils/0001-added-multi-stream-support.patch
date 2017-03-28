@@ -1,0 +1,1782 @@
+From 00c71fe0bdbd9e18b9665a15c8531d176995ee7b Mon Sep 17 00:00:00 2001
+From: "Kwan (Hingkwan) Huen-SSI" <kwan.huen@samsung.com>
+Date: Wed, 1 Feb 2017 18:57:28 -0800
+Subject: [PATCH] added multi-stream support
+
+---
+ si/Makefile       |  61 ++++++++
+ si/sg_blksz.c     | 411 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ si/sg_boctrl.c    | 121 ++++++++++++++++
+ si/sg_ielog.c     | 234 +++++++++++++++++++++++++++++++
+ si/sg_readcap.c   | 160 +++++++++++++++++++++
+ si/sg_rw.c        | 199 ++++++++++++++++++++++++++
+ si/sg_rw_stream.c | 227 ++++++++++++++++++++++++++++++
+ si/sg_stctrl.c    | 150 ++++++++++++++++++++
+ si/sg_ststat.c    | 136 ++++++++++++++++++
+ 9 files changed, 1699 insertions(+)
+ create mode 100644 si/Makefile
+ create mode 100644 si/sg_blksz.c
+ create mode 100644 si/sg_boctrl.c
+ create mode 100644 si/sg_ielog.c
+ create mode 100644 si/sg_readcap.c
+ create mode 100644 si/sg_rw.c
+ create mode 100644 si/sg_rw_stream.c
+ create mode 100644 si/sg_stctrl.c
+ create mode 100644 si/sg_ststat.c
+
+diff --git a/si/Makefile b/si/Makefile
+new file mode 100644
+index 0000000..8d22e1b
+--- /dev/null
++++ b/si/Makefile
+@@ -0,0 +1,61 @@
++SHELL = /bin/sh
++
++CC = gcc
++LD = gcc
++
++EXECS = sg_rw \
++	sg_rw_stream \
++	sg_readcap \
++	sg_stctrl \
++	sg_ststat \
++	sg_boctrl \
++	sg_ielog \
++	sg_blksz
++
++LARGE_FILE_FLAGS = -D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64
++
++CFLAGS = -g -O2 -W -Wall -iquote ../include -D_REENTRANT $(LARGE_FILE_FLAGS) 
++
++LDFLAGS =
++
++LIBFILES = ../lib/sg_lib.o ../lib/sg_lib_data.o ../lib/sg_io_linux.o
++
++all: $(EXECS)
++
++depend dep:
++	for i in *.c; do $(CC) $(INCLUDES) $(CFLAGS) -M $$i; \
++	done > .depend
++
++install:
++	/bin/cp $(EXECS) /usr/bin
++
++clean:
++	/bin/rm -f *.o $(EXECS) core .depend
++
++sg_rw: sg_rw.o $(LIBFILES)
++	$(LD) -o $@ $(LDFLAGS) $^
++
++sg_rw_stream: sg_rw_stream.o $(LIBFILES)
++	$(LD) -o $@ $(LDFLAGS) $^
++
++sg_readcap: sg_readcap.o $(LIBFILES)
++	$(LD) -o $@ $(LDFLAGS) $^
++
++sg_stctrl: sg_stctrl.o $(LIBFILES)
++	$(LD) -o $@ $(LDFLAGS) $^
++
++sg_ststat: sg_ststat.o $(LIBFILES)
++	$(LD) -o $@ $(LDFLAGS) $^
++
++sg_boctrl: sg_boctrl.o $(LIBFILES)
++	$(LD) -o $@ $(LDFLAGS) $^
++
++sg_ielog: sg_ielog.o $(LIBFILES)
++	$(LD) -static -o $@ $(LDFLAGS) $^
++
++sg_blksz: sg_blksz.o $(LIBFILES)
++	$(LD) -static -o $@ $(LDFLAGS) $^
++
++ifeq (.depend,$(wildcard .depend))
++include .depend
++endif
+diff --git a/si/sg_blksz.c b/si/sg_blksz.c
+new file mode 100644
+index 0000000..2273e0c
+--- /dev/null
++++ b/si/sg_blksz.c
+@@ -0,0 +1,411 @@
++/*
++   Copyright (C) 2015 Samsung Semiconductor
++   Hingkwan Huen (kwan.huen@ssi.samsung.com)
++
++   Simple tool to download FW for Samsung SAS SSD
++
++   Invocation: sg_fwdl -d <fw_dir_path> <scsi_device>
++
++   Important note:
++   Because device will need to reset to ROM mode, the Linux SCSI driver 
++   may remap device into different block device node (e.g., from /dev/sda
++   to /dev/sdb) after the reset. If this happens you'll see device
++   failing TUR after device comes back on after the reset. The solution
++   for this is to use device link by path under the device tree. You'll
++   can check this by:
++
++   $ ls -l /dev/disk/by-path
++   total 0
++   lrwxrwxrwx 1 root root 9 Dec 18 16:07 pci-0000:03:00.0-sas-phy2-lun-0 -> ../../sdb
++   lrwxrwxrwx 1 root root 9 Dec 18 12:41 pci-0000:03:00.0-sas-phy6-lun-0 -> ../../sda
++
++   and
++
++   $ lsscsi
++   [0:0:0:0]    cd/dvd  MATSHITA DVD-ROM UJ8E0B   1.01  /dev/sr0 
++   [4:0:0:0]    disk    NETAPP   NETAPP UNIQUE ID NT06  /dev/sda 
++   [4:0:13:0]   disk    NETAPP   NETAPP UNIQUE ID NT08  /dev/sdb 
++   [5:0:0:0]    disk    ATA      Samsung SSD 850  2B6Q  /dev/sdc 
++   [6:0:0:0]    disk    ATA      INTEL SSDSC2BF48 TG20  /dev/sdd 
++
++   Then you can choose the device link from the by-path directory. 
++   E.g., if you are trying to update firmware for /dev/sdb, which is an "NETAPP" SSD version NT08:
++
++   $ sudo ./sg_fwdl -d ./PM1633_FW_DIRECTORY /dev/disk/by-path/pci-0000\:03\:00.0-sas-phy2-lun-0 
++
++*/
++
++#include <unistd.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include <sys/ioctl.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include "sg_lib.h"
++#include "sg_io_linux.h"
++
++#define INQ_REPLY_LEN 128
++#define INQ_CMD_LEN 6
++#define TUR_CMD_LEN 6
++
++#define EBUFF_SZ 256
++
++#define SCSI_CMD_TIMEOUT 5000
++
++int check_hdr_status(sg_io_hdr_t *p_io_hdr, const char* p_cmd)
++{
++    int ok = 0;
++    char buff[64];
++    switch (sg_err_category3(p_io_hdr)) {
++    case SG_LIB_CAT_CLEAN:
++        ok = 1;
++        break;
++    case SG_LIB_CAT_RECOVERED:
++        printf("Recovered error from %s, continuing\n", p_cmd);
++        ok = 1;
++        break;
++    default: /* won't bother decoding other categories */
++	sprintf(buff, "%s command error", p_cmd);
++        sg_chk_n_print3(buff, p_io_hdr, 1);
++        break;
++    }
++    return ok;
++}
++
++
++int send_inquiry_cmd(int sg_fd) {
++    int ok = 0;
++    unsigned char sense_buffer[32];
++    sg_io_hdr_t io_hdr;
++
++    unsigned char inqBuff[INQ_REPLY_LEN];
++
++    unsigned char inqCmdBlk [INQ_CMD_LEN] =
++                                {0x12, 0, 0, 0, INQ_REPLY_LEN, 0};
++
++    /* Prepare INQUIRY command */
++    memset(&io_hdr, 0, sizeof(sg_io_hdr_t));
++    io_hdr.interface_id = 'S';
++    io_hdr.cmd_len = sizeof(inqCmdBlk);
++    /* io_hdr.iovec_count = 0; */  /* memset takes care of this */
++    io_hdr.mx_sb_len = sizeof(sense_buffer);
++    io_hdr.dxfer_direction = SG_DXFER_FROM_DEV;
++    io_hdr.dxfer_len = INQ_REPLY_LEN;
++    io_hdr.dxferp = inqBuff;
++    io_hdr.cmdp = inqCmdBlk;
++    io_hdr.sbp = sense_buffer;
++    io_hdr.timeout = SCSI_CMD_TIMEOUT;     /* 20000 millisecs == 20 seconds */
++    /* io_hdr.flags = 0; */     /* take defaults: indirect IO, etc */
++    /* io_hdr.pack_id = 0; */
++    /* io_hdr.usr_ptr = NULL; */
++
++    if (ioctl(sg_fd, SG_IO, &io_hdr) < 0) {
++        perror("sg_fwdl: Inquiry SG_IO ioctl error");
++        return -1;
++    }
++
++    /* now for the error processing */
++    ok = check_hdr_status(&io_hdr, "INQUIRY");
++    if (ok) { /* output result if it is available */
++        char * p = (char *)inqBuff;
++        int f = (int)*(p + 7);
++        printf("Device: %.8s  %.16s  %.4s  ", p + 8, p + 16, p + 32);
++        printf("[wide=%d sync=%d cmdque=%d sftre=%d]\n",
++               !!(f & 0x20), !!(f & 0x10), !!(f & 2), !!(f & 1));
++        printf("Firmware Version: %.24s\n", p+96);
++
++        /*printf("INQUIRY duration=%u millisecs, resid=%d, msg_status=%d\n",
++                   io_hdr.duration, io_hdr.resid, (int)io_hdr.msg_status); */
++    }
++    return ok;
++}
++
++
++int mode_sense_cmd(int sg_fd, unsigned char* buff, unsigned int sz) {
++    int ok = 0;
++    unsigned char sense_buffer[32];
++    sg_io_hdr_t io_hdr;
++    unsigned short blk_sz;
++    unsigned char *p = (unsigned char *) &blk_sz;
++
++    unsigned char modCmdBlk [6] =
++                                {0x1a, 0, 0x8a, 0, 0xff, 0};
++
++    /* Prepare MODE_SENSE_6 command */
++    memset(&io_hdr, 0, sizeof(sg_io_hdr_t));
++    io_hdr.interface_id = 'S';
++    io_hdr.cmd_len = sizeof(modCmdBlk);
++    /* io_hdr.iovec_count = 0; */  /* memset takes care of this */
++    io_hdr.mx_sb_len = sizeof(sense_buffer);
++    io_hdr.dxfer_direction = SG_DXFER_FROM_DEV;
++    io_hdr.dxfer_len = sz;
++    io_hdr.dxferp = buff;
++    io_hdr.cmdp = modCmdBlk;
++    io_hdr.sbp = sense_buffer;
++    io_hdr.timeout = SCSI_CMD_TIMEOUT;     /* 20000 millisecs == 20 seconds */
++    /* io_hdr.flags = 0; */     /* take defaults: indirect IO, etc */
++    /* io_hdr.pack_id = 0; */
++    /* io_hdr.usr_ptr = NULL; */
++
++    if (ioctl(sg_fd, SG_IO, &io_hdr) < 0) {
++        perror("sg_fwdl: Mode Sense SG_IO ioctl error");
++        return -1;
++    }
++
++    /* now for the error processing */
++    ok = check_hdr_status(&io_hdr, "MODE_SENSE");
++    if (ok) {  /* output result if it is available */
++	p[1] = buff[10];
++	p[0] = buff[11];
++        printf("Block Size from Block Descriptor : %u\n", blk_sz);
++        printf("Mode Sense successful!\n");
++    }
++    else
++        printf("Mode Sense failed!\n");
++/*  
++    {
++	unsigned int i;
++	printf("Mode Page = ");
++	for (i=0; i<sz; i++) {
++		if (! (i%4))
++			printf("\n%.2x: ", i);
++		printf("%.2x ",buff[i]);
++	}
++	printf("\n");
++    }
++*/	
++        printf("MODE_SENSE duration=%u millisecs, resid=%d, msg_status=%d\n",
++                   io_hdr.duration, io_hdr.resid, (int)io_hdr.msg_status); 
++    
++    return ok;
++}
++
++int mode_select_cmd(int sg_fd, unsigned char* buff, unsigned int sz) {
++    int ok = 0;
++    unsigned char sense_buffer[32];
++    sg_io_hdr_t io_hdr;
++
++    unsigned char modCmdBlk [6] =
++                                {0x15, 0x11, 0, 0, 0x18, 0};
++/*
++    unsigned int i;
++    printf("Mode Page = ");
++    for (i=0; i<sz; i++) {
++	if (! (i%4))
++		printf("\n%.2x: ", i);
++		printf("%.2x ",buff[i]);
++    }
++    printf("\n");
++*/
++    /* Prepare MODE_SELECT_6 command */
++    memset(&io_hdr, 0, sizeof(sg_io_hdr_t));
++    io_hdr.interface_id = 'S';
++    io_hdr.cmd_len = sizeof(modCmdBlk);
++    /* io_hdr.iovec_count = 0; */  /* memset takes care of this */
++    io_hdr.mx_sb_len = sizeof(sense_buffer);
++    io_hdr.dxfer_direction = SG_DXFER_TO_DEV;
++    io_hdr.dxfer_len = sz;
++    io_hdr.dxferp = buff;
++    io_hdr.cmdp = modCmdBlk;
++    io_hdr.sbp = sense_buffer;
++    io_hdr.timeout = SCSI_CMD_TIMEOUT;     /* 20000 millisecs == 20 seconds */
++    /* io_hdr.flags = 0; */     /* take defaults: indirect IO, etc */
++    /* io_hdr.pack_id = 0; */
++    /* io_hdr.usr_ptr = NULL; */
++
++    if (ioctl(sg_fd, SG_IO, &io_hdr) < 0) {
++        perror("sg_fwdl: Mode Select SG_IO ioctl error");
++        return -1;
++    }
++
++    /* now for the error processing */
++    ok = check_hdr_status(&io_hdr, "MODE_SELECT");
++    if (ok)  /* output result if it is available */
++        printf("Mode Select successful!\n");
++    else
++        printf("Mode Select failed!\n");
++        /*printf("MODE_SELECT duration=%u millisecs, resid=%d, msg_status=%d\n",
++                   io_hdr.duration, io_hdr.resid, (int)io_hdr.msg_status); */
++    return ok;
++}
++
++int format_unit_cmd(int sg_fd) {
++    int ok = 0;
++    unsigned char sense_buffer[32];
++    sg_io_hdr_t io_hdr;
++
++    unsigned char fuCmdBlk [6] = {0x4, 0x10, 0, 0, 0, 0};
++    unsigned char buff [4] = {0, 1, 0, 0};
++
++    /* Prepare FORMAT_UNIT_6 command */
++    memset(&io_hdr, 0, sizeof(sg_io_hdr_t));
++    io_hdr.interface_id = 'S';
++    io_hdr.cmd_len = sizeof(fuCmdBlk);
++    /* io_hdr.iovec_count = 0; */  /* memset takes care of this */
++    io_hdr.mx_sb_len = sizeof(sense_buffer);
++    io_hdr.dxfer_direction = SG_DXFER_TO_DEV;
++    io_hdr.dxfer_len = 4;
++    io_hdr.dxferp = buff;
++    io_hdr.cmdp = fuCmdBlk;
++    io_hdr.sbp = sense_buffer;
++    io_hdr.timeout = SCSI_CMD_TIMEOUT;     /* 20000 millisecs == 20 seconds */
++    /* io_hdr.flags = 0; */     /* take defaults: indirect IO, etc */
++    /* io_hdr.pack_id = 0; */
++    /* io_hdr.usr_ptr = NULL; */
++
++    if (ioctl(sg_fd, SG_IO, &io_hdr) < 0) {
++        perror("sg_fwdl: Format Unit SG_IO ioctl error");
++        return -1;
++    }
++
++    /* now for the error processing */
++    ok = check_hdr_status(&io_hdr, "FORMAT_UNIT");
++    if (ok)  /* output result if it is available */
++        printf("Format Unit successful!\n");
++    else
++        printf("Format Unit failed!\n");
++	
++        /* printf("FORMAT_UNIT duration=%u millisecs, resid=%d, msg_status=%d\n",
++                   io_hdr.duration, io_hdr.resid, (int)io_hdr.msg_status); */
++    return ok;
++}
++
++int change_block_size(int sg_fd, unsigned int sz) {
++    int ok = 0;
++    unsigned char buff[24];
++    unsigned char *p=(unsigned char *) &sz;
++
++    ok = mode_sense_cmd(sg_fd, buff, 24);   
++    if (ok == -1)
++    	return ok;
++    buff[10] = p[1];
++    buff[11] = p[0];
++    ok = mode_select_cmd(sg_fd, buff, 24);   
++    if (ok == -1)
++    	return ok;
++    ok = format_unit_cmd(sg_fd);   
++    if (ok == -1)
++    	return ok;
++    ok = mode_sense_cmd(sg_fd, buff, 24);   
++    if (ok == -1)
++    	return ok;
++    return ok;
++}
++
++int send_tur_cmd(int sg_fd) {
++    int ok = 0;
++    unsigned char sense_buffer[32];
++    sg_io_hdr_t io_hdr;
++
++    unsigned char turCmdBlk [TUR_CMD_LEN] =
++                                {0x00, 0, 0, 0, 0, 0};
++
++    /* Prepare TEST UNIT READY command */
++    memset(&io_hdr, 0, sizeof(sg_io_hdr_t));
++    io_hdr.interface_id = 'S';
++    io_hdr.cmd_len = sizeof(turCmdBlk);
++    io_hdr.mx_sb_len = sizeof(sense_buffer);
++    io_hdr.dxfer_direction = SG_DXFER_NONE;
++    io_hdr.cmdp = turCmdBlk;
++    io_hdr.sbp = sense_buffer;
++    io_hdr.timeout = SCSI_CMD_TIMEOUT;     /* 20000 millisecs == 20 seconds */
++
++    if (ioctl(sg_fd, SG_IO, &io_hdr) < 0) {
++        perror("sg_fwdl: Test Unit Ready SG_IO ioctl error");
++        return -1;
++    }
++
++    /* now for the error processing */
++    ok = check_hdr_status(&io_hdr, "TEST_UNIT_READY");
++    if (ok)
++        printf("Test Unit Ready successful so unit is ready!\n");
++    else
++        printf("Test Unit Ready failed so unit may _not_ be ready!\n");
++
++    /*printf("TEST UNIT READY duration=%u millisecs, resid=%d, "
++               "msg_status=%d\n", io_hdr.duration, io_hdr.resid,
++               (int)io_hdr.msg_status); */
++    return ok;
++}
++
++
++int main(int argc, char * argv[])
++{
++    int sg_fd;
++    int k, ok;
++    char ebuff[EBUFF_SZ];
++    char * file_name = 0;
++    unsigned short block_sz=512;
++
++    for (k = 1; k < argc; ++k) {
++        if (0 == memcmp("-s", argv[k], 2)) {
++	    k++;
++	    block_sz = atoi(argv[k]); /* expecting next argument to be block_sz */
++            printf("New block size : %u\n", block_sz);
++	}
++        else if (*argv[k] == '-') {
++            printf("Unrecognized switch: %s\n", argv[k]);
++            file_name = 0;
++            break;
++        }
++        else if (0 == file_name) {
++            file_name = argv[k];
++            printf("Device name: %s\n", file_name);
++	}
++        else {
++            printf("too many arguments\n");
++            file_name = 0;
++            break;
++        }
++    }
++    if (0 == file_name) {
++        printf("Usage: 'sg_blksz -s <new_size> <sg_device>'\n");
++        return 1;
++    }
++
++    /* N.B. An access mode of O_RDWR is required for some SCSI commands */
++    if ((sg_fd = open(file_name, O_RDONLY)) < 0) {
++        snprintf(ebuff, EBUFF_SZ,
++                 "sg_fwdl: error device file: %s", file_name);
++        perror(ebuff);
++        return 1;
++    }
++
++    /* Just to be safe, check we have a new sg device by trying an ioctl */
++    if ((ioctl(sg_fd, SG_GET_VERSION_NUM, &k) < 0) || (k < 30000)) {
++        printf("sg_fwdl: %s doesn't seem to be an new sg device\n",
++               file_name);
++	goto error_exit;
++    }
++
++    ok = send_tur_cmd(sg_fd);
++    if (ok == -1) {
++	goto error_exit;
++    }
++
++    ok = send_inquiry_cmd(sg_fd);
++    if (ok == -1) {
++	goto error_exit;
++    }
++
++    ok = send_tur_cmd(sg_fd);
++    if (ok == -1) {
++	goto error_exit;
++    }
++
++    ok = change_block_size(sg_fd, block_sz);
++    if (ok == -1) {
++	goto error_exit;
++    }
++
++    close(sg_fd);
++    return 0;
++
++error_exit:
++    close(sg_fd);
++    return 1;
++
++}
+diff --git a/si/sg_boctrl.c b/si/sg_boctrl.c
+new file mode 100644
+index 0000000..15fd9f7
+--- /dev/null
++++ b/si/sg_boctrl.c
+@@ -0,0 +1,121 @@
++/* 
++   This program performs a BO_CONTROL command 
++
++*  Copyright (C) Samsung Semiconductor
++*  This program is free software; you can redistribute it and/or modify
++*  it under the terms of the GNU General Public License as published by
++*  the Free Software Foundation; either version 2, or (at your option)
++*  any later version.
++
++   Invocation: sg_boctrl <-o n> <scsi_device>
++*/
++
++#include <unistd.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include <sys/ioctl.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include "sg_lib.h"
++#include "sg_io_linux.h"
++
++int main(int argc, char * argv[])
++{
++    int sg_fd, ok, k;
++    unsigned char rc16CmdBlk [16] =
++                { 0x9e, 0x15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
++
++    sg_io_hdr_t io_hdr;
++    char * file_name = 0;
++    unsigned char sense_buffer[32];
++    unsigned short bo_ctrl;
++    unsigned char  bo_time;
++
++    for (k = 1; k < argc; ++k) {
++        if (0 == strcmp("-o", argv[k])) {
++	    ++k;
++	    bo_ctrl = atoi(argv[k]); /* expecting next argument to be bo_ctrl */
++	    rc16CmdBlk[2] = (bo_ctrl << 6) & 0xff; 
++	}
++        else if (0 == strcmp("-t", argv[k])) {
++	    ++k;
++	    bo_time = atoi(argv[k]); /* expecting next argument to be bo_time */
++	    rc16CmdBlk[3] = bo_time / 100; /* BO_CTRL time in units of 100ms */
++	}
++	else if (*argv[k] == '-') {
++            printf("Unrecognized switch: %s\n", argv[k]);
++            file_name = 0;
++            break;
++        }
++        else if (0 == file_name)
++            file_name = argv[k];
++        else {
++            printf("too many arguments\n");
++            file_name = 0;
++            break;
++        }
++    }
++    if (0 == file_name) {
++        printf("Usage: 'sg_boctrl <-o opcode>  <sg_device>'\n");
++        printf("Example - No Change : 'sg_boctrl -o 0 <sg_device>'\n");
++        printf("Example - Start Op  : 'sg_boctrl -o 1 <sg_device>'\n");
++        printf("Example - Stop Op   : 'sg_boctrl -o 2 <sg_device>'\n");
++        return 1;
++    }
++
++    if ((sg_fd = open(file_name, O_RDWR)) < 0) {
++        printf("sg_boctrl: error opening file: %s", file_name);
++        return 1;
++    }
++    /* Just to be safe, check we have a new sg device by trying an ioctl */
++    if ((ioctl(sg_fd, SG_GET_VERSION_NUM, &k) < 0) || (k < 30000)) {
++        printf("sg_boctrl: %s doesn't seem to be an new sg device\n", file_name);
++        close(sg_fd);
++        return 1;
++    }
++
++    memset(&io_hdr, 0, sizeof(sg_io_hdr_t));
++    memset(sense_buffer, 0, 32);
++    io_hdr.interface_id = 'S';
++    io_hdr.cmd_len = sizeof(rc16CmdBlk);
++    io_hdr.mx_sb_len = sizeof(sense_buffer);
++    io_hdr.dxfer_direction = SG_DXFER_TO_DEV;
++    io_hdr.cmdp = rc16CmdBlk;
++    io_hdr.sbp = sense_buffer;
++
++    if (ioctl(sg_fd, SG_IO, &io_hdr) < 0) {
++        perror("sg_ststat: BO_CONTROL SG_IO ioctl error");
++        close(sg_fd);
++        return 1;
++    }
++
++    /* now for the error processing */
++    ok = 0;
++    switch (sg_err_category3(&io_hdr)) {
++    case SG_LIB_CAT_CLEAN:
++        ok = 1;
++        break;
++    case SG_LIB_CAT_UNIT_ATTENTION:
++        printf("Unit attention error on BO_CONTROL, continuing anyway\n");
++        ok = 1;
++        break;
++    case SG_LIB_CAT_RECOVERED:
++        printf("Recovered error on BO_CONTROL, continuing\n");
++        ok = 1;
++        break;
++    default: /* won't bother decoding other categories */
++        sg_chk_n_print3("BO_CONTROL command error", &io_hdr, 1);
++        break;
++    }
++
++    if (ok) { /* output result if it is available */
++       printf("BO_CONTROL duration=%u millisecs, resid=%d, msg_status=%d\n",
++               io_hdr.duration, io_hdr.resid, (int)io_hdr.msg_status);
++    }
++
++    close(sg_fd);
++    return 0;
++}
+diff --git a/si/sg_ielog.c b/si/sg_ielog.c
+new file mode 100644
+index 0000000..759dafb
+--- /dev/null
++++ b/si/sg_ielog.c
+@@ -0,0 +1,234 @@
++/* 
++   This program performs a LOG_SENSE_10 command to retrieve  
++   Informational Exceptions page  [0x2f]
++
++*  Copyright (C) Samsung Semiconductor
++*  This program is free software; you can redistribute it and/or modify
++*  it under the terms of the GNU General Public License as published by
++*  the Free Software Foundation; either version 2, or (at your option)
++*  any later version.
++
++   Invocation: sg_ielog <scsi_device>
++*/
++
++#include <unistd.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include <sys/ioctl.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include "sg_lib.h"
++#include "sg_io_linux.h"
++
++#include <time.h> 
++
++void waitFor (long secs) {
++    unsigned int retTime;
++    if (secs <= 0)
++        return;
++    retTime = time(0) + secs;     // Get finishing time.
++    while (time(0) < retTime);    // Loop until it arrives.
++}
++
++inline unsigned short  endian_swap_16(unsigned short x)
++{
++    return (unsigned short) ((x>>8) | (x<<8));
++}
++
++inline unsigned int endian_swap_32(unsigned int x)
++{
++    return (unsigned int) ((x>>24) | 
++        ((x<<8) & 0x00FF0000) |
++        ((x>>8) & 0x0000FF00) |
++        (x<<24));
++}
++
++// __int64 for MSVC, "long long" for gcc
++inline unsigned long long  endian_swap_64(unsigned long long x)
++{
++    return (unsigned long long) ( (x>>56) | 
++        ((x<<40) & 0x00FF000000000000) |
++        ((x<<24) & 0x0000FF0000000000) |
++        ((x<<8)  & 0x000000FF00000000) |
++        ((x>>8)  & 0x00000000FF000000) |
++        ((x>>24) & 0x0000000000FF0000) |
++        ((x>>40) & 0x000000000000FF00) |
++        (x<<56));
++}
++
++int process_err(sg_io_hdr_t *hdr)
++{
++    int ok = 0;
++    switch (sg_err_category3(hdr)) {
++    case SG_LIB_CAT_CLEAN:
++        ok = 1;
++        break;
++    case SG_LIB_CAT_UNIT_ATTENTION:
++        printf("Unit attention error on LOG_SENSE_10, continuing anyway\n");
++        ok = 1;
++        break;
++    case SG_LIB_CAT_RECOVERED:
++        printf("Recovered error on LOG_SENSE_10, continuing\n");
++        ok = 1;
++        break;
++    default: /* won't bother decoding other categories */
++        sg_chk_n_print3("LOG_SENSE_10 command error", hdr, 1);
++        break;
++    }
++    return ok;
++}
++
++int main(int argc, char * argv[])
++{
++    int sg_fd, k, ok, num, next;
++    /* initial 4-byte read from IE log page code 0x2f */
++    unsigned char rc10CmdBlk [10] =
++                { 0x4d, 0x00, 0x6f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00 };
++
++    sg_io_hdr_t io_hdr;
++    char * file_name = 0;
++    unsigned char rcBuff[512];
++    unsigned char sense_buffer[64];
++    unsigned short alloc_len = 4;
++    unsigned long long host_sect=0, nand_sect=0;
++    unsigned short pc;
++    unsigned char  plen;
++    unsigned char *ucp;
++    int do_verb = 0;
++    long delay = 0;
++
++    for (k = 1; k < argc; ++k) {
++	if (0 == memcmp("-d", argv[k], 2)) {
++		delay = atol(argv[k+1]);
++            	printf("delay: %lu\n", delay);
++		k++;
++	}
++        else if (*argv[k] == '-') {
++            printf("Unrecognized switch: %s\n", argv[k]);
++            file_name = 0;
++            break;
++        }
++        else if (0 == file_name)
++            file_name = argv[k];
++        else {
++            printf("too many arguments\n");
++            file_name = 0;
++            break;
++        }
++    }
++    if (0 == file_name) {
++        printf("Usage: 'sg_ielog -d <delay_in_sec> <sg_device>'\n");
++        return 1;
++    }
++
++    if ((sg_fd = open(file_name, O_RDWR)) < 0) {
++        printf("sg_ielog: error opening file: %s", file_name);
++        return 1;
++    }
++    /* Just to be safe, check we have a new sg device by trying an ioctl */
++    if ((ioctl(sg_fd, SG_GET_VERSION_NUM, &k) < 0) || (k < 30000)) {
++        printf("sg_ielog: %s doesn't seem to be an new sg device\n", file_name);
++        close(sg_fd);
++        return 1;
++    }
++
++    memset(&io_hdr, 0, sizeof(sg_io_hdr_t));
++    io_hdr.interface_id = 'S';
++    io_hdr.cmd_len = sizeof(rc10CmdBlk);
++    io_hdr.mx_sb_len = sizeof(sense_buffer);
++    io_hdr.dxfer_direction = SG_DXFER_FROM_DEV;
++    io_hdr.dxfer_len = sizeof(rcBuff);
++    io_hdr.dxferp = rcBuff;
++    io_hdr.cmdp = rc10CmdBlk;
++    io_hdr.sbp = sense_buffer;
++    io_hdr.timeout = 20000;     /* 20000 millisecs == 20 seconds */
++
++    if (ioctl(sg_fd, SG_IO, &io_hdr) < 0) {
++        perror("sg_ielog: LOG_SENSE_10 SG_IO ioctl error");
++        close(sg_fd);
++        return 1;
++    }
++
++    ok = process_err(&io_hdr);
++    if (ok) { /* output result if it is available */
++       if (do_verb) {
++          printf("LOG_SENSE_10 duration=%u millisecs, resid=%d, msg_status=%d\n",
++               io_hdr.duration, io_hdr.resid, (int)io_hdr.msg_status);
++          printf("   Received Buff: ");
++          for (k=0; k<alloc_len; k++)
++            printf(" %.2x", rcBuff[k]);
++          printf("\n");
++       }
++       /* Update LOG_SENSE_10 request byte count */
++       rc10CmdBlk[7] = rcBuff[2];
++       rc10CmdBlk[8] = rcBuff[3] + 4;
++       alloc_len = (rcBuff[3]+4) | (rcBuff[2] << 8);
++   while (1) {
++       time_t ltime; /* calendar time */
++       ltime=time(NULL); /* get current cal time */
++       printf("%s",asctime( localtime(&ltime) ) );
++
++       if (ioctl(sg_fd, SG_IO, &io_hdr) < 0) {
++           perror("sg_ielog: LOG_SENSE_10 SG_IO ioctl error");
++           close(sg_fd);
++           return 1;
++       }
++
++       /* now for the error processing */
++       ok = process_err(&io_hdr);
++       if (ok) { /* output result if it is available */
++          if (do_verb) {
++             printf("LOG_SENSE_10 duration=%u millisecs, resid=%d, msg_status=%d\n",
++               io_hdr.duration, io_hdr.resid, (int)io_hdr.msg_status);
++             printf("   Received Buff: ");
++             for (k=0; k<alloc_len; k++) {
++		if (!(k % 0x10))
++          		printf("\n%.3x	", k);
++            	printf(" %.2x", rcBuff[k]);
++	     }
++             printf("\n");
++          } 
++          ucp = &rcBuff[0] + 4;
++          num = alloc_len - 4;
++          if (num < 4) {
++              perror("sg_ielog: badly formed Informational Exceptions page");
++              close(sg_fd);
++              return 1;
++          }
++          next = 0;
++          for (k = num; k > 0; k -= next, ucp += next) {
++	     if (k < 3) {
++                 perror("sg_ielog: short Informational Exceptions page\n");
++                 close(sg_fd);
++                 return 1;
++	     }
++	     next = ucp[3] + 4; /* total len of the current param */
++	     pc = (ucp[0] << 8) + ucp[1];
++	     if (pc == 0xe9) {
++		plen = ucp[3];
++		if (plen == 8)
++       			host_sect = endian_swap_64(*((unsigned long long *) &ucp[4]));
++                printf("   found 0xe9 param: data_units_written = %llu \n", host_sect);
++	     }
++	     else if (pc == 0xeb) {
++		plen = ucp[3];
++		if (plen == 8)
++       			nand_sect = endian_swap_64(*((unsigned long long *) &ucp[4]));
++                printf("   found 0xeb param: nand_data_units_written = %llu \n", nand_sect);
++	     }
++          }
++       }
++       if (delay)
++       	waitFor (delay);
++       else
++	break;
++   }
++    }
++
++    close(sg_fd);
++    return 0;
++}
+diff --git a/si/sg_readcap.c b/si/sg_readcap.c
+new file mode 100644
+index 0000000..d57edfe
+--- /dev/null
++++ b/si/sg_readcap.c
+@@ -0,0 +1,160 @@
++/* 
++   This program performs a READ_CAP_16 command as scsi mid-level support
++   16 byte commands 
++
++*  Copyright (C) Samsung Semiconductor
++*  This program is free software; you can redistribute it and/or modify
++*  it under the terms of the GNU General Public License as published by
++*  the Free Software Foundation; either version 2, or (at your option)
++*  any later version.
++
++   Invocation: sg_readcap <scsi_device>
++*/
++
++#include <unistd.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include <sys/ioctl.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include "sg_lib.h"
++#include "sg_io_linux.h"
++
++inline unsigned short  endian_swap_16(unsigned short x)
++{
++    return (unsigned short) ((x>>8) | (x<<8));
++}
++
++inline unsigned int endian_swap_32(unsigned int x)
++{
++    return (unsigned int) ((x>>24) | 
++        ((x<<8) & 0x00FF0000) |
++        ((x>>8) & 0x0000FF00) |
++        (x<<24));
++}
++
++// __int64 for MSVC, "long long" for gcc
++inline unsigned long long  endian_swap_64(unsigned long long x)
++{
++    return (unsigned long long) ( (x>>56) | 
++        ((x<<40) & 0x00FF000000000000) |
++        ((x<<24) & 0x0000FF0000000000) |
++        ((x<<8)  & 0x000000FF00000000) |
++        ((x>>8)  & 0x00000000FF000000) |
++        ((x>>24) & 0x0000000000FF0000) |
++        ((x>>40) & 0x000000000000FF00) |
++        (x<<56));
++}
++
++int main(int argc, char * argv[])
++{
++    int sg_fd, k, ok;
++    unsigned char rc16CmdBlk [16] =
++                { 0x9e, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x20, 0, 0 };
++
++    sg_io_hdr_t io_hdr;
++    char * file_name = 0;
++    unsigned char rcBuff[64];
++    unsigned char sense_buffer[64];
++    unsigned long long  num_sect;
++    unsigned int sect_sz;
++    int prot_en, p_type;
++
++    for (k = 1; k < argc; ++k) {
++        if (*argv[k] == '-') {
++            printf("Unrecognized switch: %s\n", argv[k]);
++            file_name = 0;
++            break;
++        }
++        else if (0 == file_name)
++            file_name = argv[k];
++        else {
++            printf("too many arguments\n");
++            file_name = 0;
++            break;
++        }
++    }
++    if (0 == file_name) {
++        printf("Usage: 'sg_readcap <sg_device>'\n");
++        return 1;
++    }
++
++    if ((sg_fd = open(file_name, O_RDWR)) < 0) {
++        printf("sg_readcap: error opening file: %s", file_name);
++        return 1;
++    }
++    /* Just to be safe, check we have a new sg device by trying an ioctl */
++    if ((ioctl(sg_fd, SG_GET_VERSION_NUM, &k) < 0) || (k < 30000)) {
++        printf("sg_readcap: %s doesn't seem to be an new sg device\n", file_name);
++        close(sg_fd);
++        return 1;
++    }
++
++    memset(&io_hdr, 0, sizeof(sg_io_hdr_t));
++    io_hdr.interface_id = 'S';
++    io_hdr.cmd_len = sizeof(rc16CmdBlk);
++    io_hdr.mx_sb_len = sizeof(sense_buffer);
++    io_hdr.dxfer_direction = SG_DXFER_FROM_DEV;
++    io_hdr.dxfer_len = sizeof(rcBuff);
++    io_hdr.dxferp = rcBuff;
++    io_hdr.cmdp = rc16CmdBlk;
++    io_hdr.sbp = sense_buffer;
++    io_hdr.timeout = 20000;     /* 20000 millisecs == 20 seconds */
++
++    if (ioctl(sg_fd, SG_IO, &io_hdr) < 0) {
++        perror("sg_readcap: READ_CAP_16 SG_IO ioctl error");
++        close(sg_fd);
++        return 1;
++    }
++
++    /* now for the error processing */
++    ok = 0;
++    switch (sg_err_category3(&io_hdr)) {
++    case SG_LIB_CAT_CLEAN:
++        ok = 1;
++        break;
++    case SG_LIB_CAT_UNIT_ATTENTION:
++        printf("Unit attention error on READ_CAP_16, continuing anyway\n");
++        ok = 1;
++        break;
++    case SG_LIB_CAT_RECOVERED:
++        printf("Recovered error on READ_CAP_16, continuing\n");
++        ok = 1;
++        break;
++    default: /* won't bother decoding other categories */
++        sg_chk_n_print3("READ_CAP_16 command error", &io_hdr, 1);
++        break;
++    }
++
++    if (ok) { /* output result if it is available */
++       printf("READ_CAP_16 duration=%u millisecs, resid=%d, msg_status=%d\n",
++               io_hdr.duration, io_hdr.resid, (int)io_hdr.msg_status);
++       printf("   Received Buff: ");
++       for (k=0; k<32; k++)
++            printf(" %.2x", rcBuff[k]);
++       printf("\n");
++       num_sect = endian_swap_64(*((unsigned long long *) rcBuff)) + 1;
++       sect_sz =  endian_swap_32(*((unsigned int *) (rcBuff+8)));
++
++       prot_en = !!(rcBuff[12] & 0x1);
++       p_type = ((rcBuff[12] >> 1) & 0x7);
++
++       printf("   Protection: prot_en=%d, p_type=%d, p_i_exponent=%d",
++                   prot_en, p_type, ((rcBuff[13] >> 4) & 0xf));
++       if (prot_en)
++          printf(" [type %d protection]\n", p_type + 1);
++       else
++          printf("\n");
++
++       printf("number of sectors=%llu, sector size=%u\n",
++            num_sect, sect_sz);
++
++    }
++
++    close(sg_fd);
++    return 0;
++}
+diff --git a/si/sg_rw.c b/si/sg_rw.c
+new file mode 100644
+index 0000000..d253e27
+--- /dev/null
++++ b/si/sg_rw.c
+@@ -0,0 +1,199 @@
++#include <unistd.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include <sys/ioctl.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <stdlib.h>
++#include "sg_lib.h"
++#include "sg_io_linux.h"
++
++/* This program performs a READ_16 command as scsi mid-level support
++   16 byte commands from lk 2.4.15
++
++*  Copyright (C) 2001 D. Gilbert
++*  This program is free software; you can redistribute it and/or modify
++*  it under the terms of the GNU General Public License as published by
++*  the Free Software Foundation; either version 2, or (at your option)
++*  any later version.
++
++   Invocation: sg_rw <scsi_device>
++
++   Version 1.02 (20020206)
++
++*/
++
++#define READ16_BUFF_LEN 4096
++#define READ16_CMD_LEN 16
++
++#define WRITE16_BUFF_LEN 4096
++#define WRITE16_CMD_LEN 16
++
++#define EBUFF_SZ 256
++
++int main(int argc, char * argv[])
++{
++    int sg_fd, k, rok, wok;
++
++    unsigned char r16CmdBlk [READ16_CMD_LEN] =
++                {0x88, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0};
++
++    unsigned char w16CmdBlk [WRITE16_CMD_LEN] =
++                {0x8a, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0};
++
++    sg_io_hdr_t io_hdr;
++
++    char * file_name = 0;
++    char ebuff[EBUFF_SZ];
++
++    unsigned char inBuff[READ16_BUFF_LEN];
++    unsigned char outBuff[WRITE16_BUFF_LEN];
++
++    unsigned char sense_buffer[32];
++
++    srand(time(NULL));
++
++    for (k = 1; k < argc; ++k) {
++        if (*argv[k] == '-') {
++            printf("Unrecognized switch: %s\n", argv[k]);
++            file_name = 0;
++            break;
++        }
++        else if (0 == file_name)
++            file_name = argv[k];
++        else {
++            printf("too many arguments\n");
++            file_name = 0;
++            break;
++        }
++    }
++    if (0 == file_name) {
++        printf("Usage: 'sg_rw <sg_device>'\n");
++        return 1;
++    }
++
++    if ((sg_fd = open(file_name, O_RDWR)) < 0) {
++        snprintf(ebuff, EBUFF_SZ,
++                 "sg_rw: error opening file: %s", file_name);
++        perror(ebuff);
++        return 1;
++    }
++    /* Just to be safe, check we have a new sg device by trying an ioctl */
++    if ((ioctl(sg_fd, SG_GET_VERSION_NUM, &k) < 0) || (k < 30000)) {
++        printf("sg_rw: %s doesn't seem to be a new sg device\n",
++               file_name);
++        close(sg_fd);
++        return 1;
++    }
++    printf("sg_rw: SG_GET_VERSION_NUM %d\n", k);
++
++    for (k = 0; k < WRITE16_BUFF_LEN; k++) 
++	outBuff[k] = (unsigned char) rand();	
++
++    /* Prepare WRITE_16 command */
++    memset(&io_hdr, 0, sizeof(sg_io_hdr_t));
++    io_hdr.interface_id = 'S';
++    io_hdr.cmd_len = sizeof(w16CmdBlk);
++    /* io_hdr.iovec_count = 0; */  /* memset takes care of this */
++    io_hdr.mx_sb_len = sizeof(sense_buffer);
++    io_hdr.dxfer_direction = SG_DXFER_TO_DEV;
++    io_hdr.dxfer_len = WRITE16_BUFF_LEN;
++    io_hdr.dxferp = outBuff;
++    io_hdr.cmdp = w16CmdBlk;
++    io_hdr.sbp = sense_buffer;
++    io_hdr.timeout = 20000;     /* 20000 millisecs == 20 seconds */
++    /* io_hdr.flags = 0; */     /* take defaults: indirect IO, etc */
++    /* io_hdr.pack_id = 0; */
++    /* io_hdr.usr_ptr = NULL; */
++
++    if (ioctl(sg_fd, SG_IO, &io_hdr) < 0) {
++        perror("sg_rw: Inquiry SG_IO ioctl error");
++        close(sg_fd);
++        return 1;
++    }
++
++    /* now for the error processing */
++    wok = 0;
++    switch (sg_err_category3(&io_hdr)) {
++    case SG_LIB_CAT_CLEAN:
++        wok = 1;
++        break;
++    case SG_LIB_CAT_RECOVERED:
++        printf("Recovered error on WRITE_16, continuing\n");
++        wok = 1;
++        break;
++    default: /* won't bother decoding other categories */
++        sg_chk_n_print3("WRITE_16 command error", &io_hdr, 1);
++        break;
++    }
++
++    if (wok) { /* output result if it is available */
++        printf("WRITE_16 duration=%u millisecs, resid=%d, msg_status=%d\n",
++               io_hdr.duration, io_hdr.resid, (int)io_hdr.msg_status);
++        printf("WRITE BUFFER: \n"); 
++	for (k=0;k < 8; k++)
++        	printf("%.2x ", outBuff[k]); 
++	printf("...\n");
++    }
++
++
++    /* Prepare READ_16 command */
++    memset(&io_hdr, 0, sizeof(sg_io_hdr_t));
++    io_hdr.interface_id = 'S';
++    io_hdr.cmd_len = sizeof(r16CmdBlk);
++    /* io_hdr.iovec_count = 0; */  /* memset takes care of this */
++    io_hdr.mx_sb_len = sizeof(sense_buffer);
++    io_hdr.dxfer_direction = SG_DXFER_FROM_DEV;
++    io_hdr.dxfer_len = READ16_BUFF_LEN;
++    io_hdr.dxferp = inBuff;
++    io_hdr.cmdp = r16CmdBlk;
++    io_hdr.sbp = sense_buffer;
++    io_hdr.timeout = 20000;     /* 20000 millisecs == 20 seconds */
++    /* io_hdr.flags = 0; */     /* take defaults: indirect IO, etc */
++    /* io_hdr.pack_id = 0; */
++    /* io_hdr.usr_ptr = NULL; */
++
++    if (ioctl(sg_fd, SG_IO, &io_hdr) < 0) {
++        perror("sg_rw: Inquiry SG_IO ioctl error");
++        close(sg_fd);
++        return 1;
++    }
++
++    /* now for the error processing */
++    rok = 0;
++    switch (sg_err_category3(&io_hdr)) {
++    case SG_LIB_CAT_CLEAN:
++        rok = 1;
++        break;
++    case SG_LIB_CAT_RECOVERED:
++        printf("Recovered error on READ_16, continuing\n");
++        rok = 1;
++        break;
++    default: /* won't bother decoding other categories */
++        sg_chk_n_print3("READ_16 command error", &io_hdr, 1);
++        break;
++    }
++
++    if (rok) { /* output result if it is available */
++        printf("READ_16 duration=%u millisecs, resid=%d, msg_status=%d\n",
++               io_hdr.duration, io_hdr.resid, (int)io_hdr.msg_status);
++
++        printf("READ BUFFER: \n"); 
++	for (k=0;k < 8; k++)
++        	printf("%.2x ", inBuff[k]); 
++	printf("...\n");
++    }
++
++    if (rok && wok)
++	for (k=0;k < WRITE16_BUFF_LEN; k++)
++        	if (outBuff[k] != inBuff[k])
++        		printf("COMPARE ERROR pos=%d, out_val=%u, in_val=%u\n", 
++				k, outBuff[k], inBuff[k]);
++
++    close(sg_fd);
++    return 0;
++}
+diff --git a/si/sg_rw_stream.c b/si/sg_rw_stream.c
+new file mode 100644
+index 0000000..ade1ce3
+--- /dev/null
++++ b/si/sg_rw_stream.c
+@@ -0,0 +1,227 @@
++#include <unistd.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include <sys/ioctl.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <stdlib.h>
++#include "sg_lib.h"
++#include "sg_io_linux.h"
++
++/* This program performs a READ_16 command as scsi mid-level support
++   16 byte commands from lk 2.4.15
++
++*  Copyright (C) 2001 D. Gilbert
++*  This program is free software; you can redistribute it and/or modify
++*  it under the terms of the GNU General Public License as published by
++*  the Free Software Foundation; either version 2, or (at your option)
++*  any later version.
++
++   Invocation: sg_rw_stream -i <id> <scsi_device>
++
++   Version 1.02 (20020206)
++
++*/
++
++#define READ16_BUFF_LEN 16384
++#define READ16_CMD_LEN 16
++
++#define WRITE16_BUFF_LEN 16384
++#define WRITE16_CMD_LEN 16
++
++#define EBUFF_SZ 256
++
++int main(int argc, char * argv[])
++{
++    int sg_fd, rok, wok;
++
++    unsigned short str_id, k;
++
++    unsigned char r16CmdBlk [READ16_CMD_LEN] =
++                {0x88, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
++
++    unsigned char w16CmdBlk [WRITE16_CMD_LEN] =
++                {0x9a, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
++
++    sg_io_hdr_t io_hdr;
++
++    char * file_name = 0;
++    char ebuff[EBUFF_SZ];
++
++    unsigned char inBuff[READ16_BUFF_LEN];
++    unsigned char outBuff[WRITE16_BUFF_LEN];
++
++    unsigned char sense_buffer[32];
++
++    srand(time(NULL));
++
++    for (k = 1; k < argc; ++k) {
++	if (0 == strcmp("-i", argv[k])) {
++            ++k;
++            str_id = atoi(argv[k]); /* expecting next argument to be strid */
++            if (str_id>32) {
++                printf("Invalid Stream ID Entered: %s\n", argv[k]);
++                file_name = 0;
++                break;
++            }
++            w16CmdBlk[10] = (str_id>>8) & 0xff;
++            w16CmdBlk[11] = str_id & 0xff;
++        }
++        else if (*argv[k] == '-') {
++            printf("Unrecognized switch: %s\n", argv[k]);
++            file_name = 0;
++            break;
++        }
++        else if (0 == file_name)
++            file_name = argv[k];
++        else {
++            printf("too many arguments\n");
++            file_name = 0;
++            break;
++        }
++    }
++    if (0 == file_name) {
++        printf("Usage: 'sg_rw_stream -i <id> <sg_device>'\n");
++        return 1;
++    }
++
++    if ((sg_fd = open(file_name, O_RDWR)) < 0) {
++        snprintf(ebuff, EBUFF_SZ,
++                 "sg_rw_stream: error opening file: %s", file_name);
++        perror(ebuff);
++        return 1;
++    }
++    /* Just to be safe, check we have a new sg device by trying an ioctl */
++    if ((ioctl(sg_fd, SG_GET_VERSION_NUM, &k) < 0) || (k < 30000)) {
++        printf("sg_rw_stream: %s doesn't seem to be a new sg device\n",
++               file_name);
++        close(sg_fd);
++        return 1;
++    }
++    /* transfer length is number of contiguous data blocks */
++    r16CmdBlk[12] = ((READ16_BUFF_LEN/512)>>8) & 0xff;
++    r16CmdBlk[13] = (READ16_BUFF_LEN/512) & 0xff;
++    w16CmdBlk[12] = ((WRITE16_BUFF_LEN/512)>>8) & 0xff;
++    w16CmdBlk[13] = (WRITE16_BUFF_LEN/512) & 0xff;
++
++    printf("sg_rw_stream: SG_GET_VERSION_NUM %d\n", k);
++
++    for (k = 0; k < WRITE16_BUFF_LEN; k++) 
++	outBuff[k] = (unsigned char) rand();	
++
++    printf("WR CDB: ");
++    for (k = 0; k < WRITE16_CMD_LEN; k++) 
++    	printf("%.2x ", w16CmdBlk[k]);
++    printf("\n");
++
++    /* Prepare WRITE_16 command */
++    memset(&io_hdr, 0, sizeof(sg_io_hdr_t));
++    io_hdr.interface_id = 'S';
++    io_hdr.cmd_len = sizeof(w16CmdBlk);
++    /* io_hdr.iovec_count = 0; */  /* memset takes care of this */
++    io_hdr.mx_sb_len = sizeof(sense_buffer);
++    io_hdr.dxfer_direction = SG_DXFER_TO_DEV;
++    io_hdr.dxfer_len = WRITE16_BUFF_LEN;
++    io_hdr.dxferp = outBuff;
++    io_hdr.cmdp = w16CmdBlk;
++    io_hdr.sbp = sense_buffer;
++    io_hdr.timeout = 20000;     /* 20000 millisecs == 20 seconds */
++    /* io_hdr.flags = 0; */     /* take defaults: indirect IO, etc */
++    /* io_hdr.pack_id = 0; */
++    /* io_hdr.usr_ptr = NULL; */
++
++    if (ioctl(sg_fd, SG_IO, &io_hdr) < 0) {
++        perror("sg_rw_stream: Inquiry SG_IO ioctl error");
++        close(sg_fd);
++        return 1;
++    }
++
++    /* now for the error processing */
++    wok = 0;
++    switch (sg_err_category3(&io_hdr)) {
++    case SG_LIB_CAT_CLEAN:
++        wok = 1;
++        break;
++    case SG_LIB_CAT_RECOVERED:
++        printf("Recovered error on WRITE_16, continuing\n");
++        wok = 1;
++        break;
++    default: /* won't bother decoding other categories */
++        sg_chk_n_print3("WRITE_16 command error", &io_hdr, 1);
++        break;
++    }
++
++    if (wok) { /* output result if it is available */
++        printf("WRITE_16 duration=%u millisecs, resid=%d, msg_status=%d\n",
++               io_hdr.duration, io_hdr.resid, (int)io_hdr.msg_status);
++        printf("WRITE BUFFER: \n"); 
++	for (k=0;k < 8; k++)
++        	printf("%.2x ", outBuff[k]); 
++	printf("...\n");
++    }
++
++
++    printf("RD CDB: ");
++    for (k = 0; k < READ16_CMD_LEN; k++) 
++    	printf("%.2x ", r16CmdBlk[k]);
++    printf("\n");
++    /* Prepare READ_16 command */
++    memset(&io_hdr, 0, sizeof(sg_io_hdr_t));
++    io_hdr.interface_id = 'S';
++    io_hdr.cmd_len = sizeof(r16CmdBlk);
++    /* io_hdr.iovec_count = 0; */  /* memset takes care of this */
++    io_hdr.mx_sb_len = sizeof(sense_buffer);
++    io_hdr.dxfer_direction = SG_DXFER_FROM_DEV;
++    io_hdr.dxfer_len = READ16_BUFF_LEN;
++    io_hdr.dxferp = inBuff;
++    io_hdr.cmdp = r16CmdBlk;
++    io_hdr.sbp = sense_buffer;
++    io_hdr.timeout = 20000;     /* 20000 millisecs == 20 seconds */
++    /* io_hdr.flags = 0; */     /* take defaults: indirect IO, etc */
++    /* io_hdr.pack_id = 0; */
++    /* io_hdr.usr_ptr = NULL; */
++
++    if (ioctl(sg_fd, SG_IO, &io_hdr) < 0) {
++        perror("sg_rw_stream: Inquiry SG_IO ioctl error");
++        close(sg_fd);
++        return 1;
++    }
++
++    /* now for the error processing */
++    rok = 0;
++    switch (sg_err_category3(&io_hdr)) {
++    case SG_LIB_CAT_CLEAN:
++        rok = 1;
++        break;
++    case SG_LIB_CAT_RECOVERED:
++        printf("Recovered error on READ_16, continuing\n");
++        rok = 1;
++        break;
++    default: /* won't bother decoding other categories */
++        sg_chk_n_print3("READ_16 command error", &io_hdr, 1);
++        break;
++    }
++
++    if (rok) { /* output result if it is available */
++        printf("READ_16 duration=%u millisecs, resid=%d, msg_status=%d\n",
++               io_hdr.duration, io_hdr.resid, (int)io_hdr.msg_status);
++
++        printf("READ BUFFER: \n"); 
++	for (k=0;k < 8; k++)
++        	printf("%.2x ", inBuff[k]); 
++	printf("...\n");
++    }
++
++    if (rok && wok)
++	for (k=0;k < WRITE16_BUFF_LEN; k++)
++        	if (outBuff[k] != inBuff[k])
++        		printf("COMPARE ERROR pos=%d, out_val=%u, in_val=%u\n", 
++				k, outBuff[k], inBuff[k]);
++
++    close(sg_fd);
++    return 0;
++}
+diff --git a/si/sg_stctrl.c b/si/sg_stctrl.c
+new file mode 100644
+index 0000000..3c68826
+--- /dev/null
++++ b/si/sg_stctrl.c
+@@ -0,0 +1,150 @@
++/* 
++   This program performs a STREAM_CONTROL command for
++	STR_CTL: 0x1 (Open Stream); 0x2 (Close Stream)
++
++*  Copyright (C) Samsung Semiconductor
++*  This program is free software; you can redistribute it and/or modify
++*  it under the terms of the GNU General Public License as published by
++*  the Free Software Foundation; either version 2, or (at your option)
++*  any later version.
++
++   Invocation: sg_stctrl <-o|-i n> <scsi_device>
++*/
++
++#include <unistd.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include <sys/ioctl.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include "sg_lib.h"
++#include "sg_io_linux.h"
++
++int main(int argc, char * argv[])
++{
++    int sg_fd, k, ok;
++    unsigned char rc16CmdBlk [16] =
++                { 0x9e, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
++
++    sg_io_hdr_t io_hdr;
++    char * file_name = 0;
++    unsigned char rcBuff[8];
++    unsigned char sense_buffer[32];
++    unsigned char op_type=0;
++    unsigned short str_id;
++
++    for (k = 1; k < argc; ++k) {
++        if (0 == strcmp("-o", argv[k])) {
++            op_type = 1; /* open a stream */
++	    rc16CmdBlk[1] |= (op_type<<5);
++	    rc16CmdBlk[13] = 8; /* expecting 8 bytes in return buff */
++	}
++        else if (0 == strcmp("-c", argv[k])) {
++            op_type = 2; /* close a stream */
++	    ++k;
++	    str_id = atoi(argv[k]); /* expecting next argument to be str_id */
++	    if (str_id>32) { 
++            	printf("Invalid Stream ID Entered: %s\n", argv[k]);
++		file_name = 0;
++                op_type = 0; 
++		break;
++	    }
++	    rc16CmdBlk[1] |= (op_type<<5);
++	    rc16CmdBlk[4] = (str_id >> 8) & 0xff; 
++	    rc16CmdBlk[5] = str_id & 0xff; 
++	}
++	else if (*argv[k] == '-') {
++            printf("Unrecognized switch: %s\n", argv[k]);
++            file_name = 0;
++            break;
++        }
++        else if (0 == file_name)
++            file_name = argv[k];
++        else {
++            printf("too many arguments\n");
++            file_name = 0;
++            break;
++        }
++    }
++    if (0 == file_name || 0==op_type) {
++        printf("Usage: 'sg_stctrl <-o|-c id>  <sg_device>'\n");
++        printf("Example - Open Stream: 'sg_stctrl -o <sg_device>'\n");
++        printf("Example - Close Stream: 'sg_stctrl -c <str_id_num> <sg_device>'\n");
++        return 1;
++    }
++
++    if ((sg_fd = open(file_name, O_RDWR)) < 0) {
++        printf("sg_stctrl: error opening file: %s", file_name);
++        return 1;
++    }
++    /* Just to be safe, check we have a new sg device by trying an ioctl */
++    if ((ioctl(sg_fd, SG_GET_VERSION_NUM, &k) < 0) || (k < 30000)) {
++        printf("sg_stctrl: %s doesn't seem to be an new sg device\n", file_name);
++        close(sg_fd);
++        return 1;
++    }
++
++    memset(&io_hdr, 0, sizeof(sg_io_hdr_t));
++    memset(rcBuff, 0, 8);
++    memset(sense_buffer, 0, 32);
++    io_hdr.interface_id = 'S';
++    io_hdr.cmd_len = sizeof(rc16CmdBlk);
++    io_hdr.mx_sb_len = sizeof(sense_buffer);
++    if (op_type == 1) { /* open stream */
++       io_hdr.dxfer_direction = SG_DXFER_FROM_DEV;
++       io_hdr.dxfer_len = sizeof(rcBuff);
++       io_hdr.dxferp = rcBuff;
++    }
++    else if (op_type == 2) { /* close stream */
++       io_hdr.dxfer_direction = SG_DXFER_TO_DEV;
++       io_hdr.dxfer_len = 0;
++       io_hdr.dxferp = 0;
++    }
++    io_hdr.cmdp = rc16CmdBlk;
++    io_hdr.sbp = sense_buffer;
++    io_hdr.timeout = 20000;     /* 20000 millisecs == 20 seconds */
++
++    if (ioctl(sg_fd, SG_IO, &io_hdr) < 0) {
++        perror("sg_stctrl: STREAM CONTROL SG_IO ioctl error");
++        close(sg_fd);
++        return 1;
++    }
++
++    /* now for the error processing */
++    ok = 0;
++    switch (sg_err_category3(&io_hdr)) {
++    case SG_LIB_CAT_CLEAN:
++        ok = 1;
++        break;
++    case SG_LIB_CAT_UNIT_ATTENTION:
++        printf("Unit attention error on STREAM_CONTROL, continuing anyway\n");
++        ok = 1;
++        break;
++    case SG_LIB_CAT_RECOVERED:
++        printf("Recovered error on STREAM_CONTROL, continuing\n");
++        ok = 1;
++        break;
++    default: /* won't bother decoding other categories */
++        sg_chk_n_print3("STREAM_CONTROL command error", &io_hdr, 1);
++        break;
++    }
++
++    if (ok) { /* output result if it is available */
++       printf("STREAM_CONTROL duration=%u millisecs, resid=%d, msg_status=%d\n",
++               io_hdr.duration, io_hdr.resid, (int)io_hdr.msg_status);
++       if (op_type == 1) { /* open stream */
++          printf("   Received Buff: ");
++          for (k=0; k<8; k++)
++               printf(" %.2x", rcBuff[k]);
++          printf("\n");
++          printf("STREAM_CONTROL open stream with id %u returned\n", rcBuff[4]<<8 | rcBuff[5]);
++       }
++
++    }
++
++    close(sg_fd);
++    return 0;
++}
+diff --git a/si/sg_ststat.c b/si/sg_ststat.c
+new file mode 100644
+index 0000000..9158816
+--- /dev/null
++++ b/si/sg_ststat.c
+@@ -0,0 +1,136 @@
++/* 
++   This program performs a STREAM_STATUS command 
++
++*  Copyright (C) Samsung Semiconductor
++*  This program is free software; you can redistribute it and/or modify
++*  it under the terms of the GNU General Public License as published by
++*  the Free Software Foundation; either version 2, or (at your option)
++*  any later version.
++
++   Invocation: sg_ststat <-i n> <scsi_device>
++*/
++
++#include <unistd.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <errno.h>
++#include <sys/ioctl.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include "sg_lib.h"
++#include "sg_io_linux.h"
++
++int main(int argc, char * argv[])
++{
++    int sg_fd, ok, k;
++    unsigned char rc16CmdBlk [16] =
++                { 0x9e, 0x16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
++
++    sg_io_hdr_t io_hdr;
++    char * file_name = 0;
++    unsigned char rcBuff[128+8]; /* 16 streams * 8-byte desc + 8-byte header */
++    unsigned char sense_buffer[32];
++    unsigned short str_id;  /* default to start with stream id 1 */
++    unsigned int  alloc_len = 8;
++
++    for (k = 1; k < argc; ++k) {
++        if (0 == strcmp("-i", argv[k])) {
++	    ++k;
++	    str_id = atoi(argv[k]); /* expecting next argument to be str_id */
++	    if (str_id<1 || str_id>16) { 
++            	printf("Invalid Stream ID Entered: %s\n", argv[k]);
++		file_name = 0;
++		break;
++	    }
++	    alloc_len += (16-str_id+1)*8;
++	    rc16CmdBlk[4] = (str_id >> 8) & 0xff; 
++	    rc16CmdBlk[5] = str_id & 0xff; 
++	    rc16CmdBlk[10] = (alloc_len >> 24) & 0xff; 
++	    rc16CmdBlk[11] = (alloc_len >> 16) & 0xff; 
++	    rc16CmdBlk[12] = (alloc_len >> 8 ) & 0xff; 
++	    rc16CmdBlk[13] = (alloc_len) & 0xff; 
++	}
++	else if (*argv[k] == '-') {
++            printf("Unrecognized switch: %s\n", argv[k]);
++            file_name = 0;
++            break;
++        }
++        else if (0 == file_name)
++            file_name = argv[k];
++        else {
++            printf("too many arguments\n");
++            file_name = 0;
++            break;
++        }
++    }
++    if (0 == file_name) {
++        printf("Usage: 'sg_ststat <-i id>  <sg_device>'\n");
++        return 1;
++    }
++
++    if ((sg_fd = open(file_name, O_RDWR)) < 0) {
++        printf("sg_ststat: error opening file: %s", file_name);
++        return 1;
++    }
++    /* Just to be safe, check we have a new sg device by trying an ioctl */
++    if ((ioctl(sg_fd, SG_GET_VERSION_NUM, &k) < 0) || (k < 30000)) {
++        printf("sg_ststat: %s doesn't seem to be an new sg device\n", file_name);
++        close(sg_fd);
++        return 1;
++    }
++
++    memset(&io_hdr, 0, sizeof(sg_io_hdr_t));
++    memset(rcBuff, 0, 8);
++    memset(sense_buffer, 0, 32);
++    io_hdr.interface_id = 'S';
++    io_hdr.cmd_len = sizeof(rc16CmdBlk);
++    io_hdr.mx_sb_len = sizeof(sense_buffer);
++    io_hdr.dxfer_direction = SG_DXFER_FROM_DEV;
++    io_hdr.dxfer_len = (alloc_len < sizeof(rcBuff)) ? alloc_len : sizeof(rcBuff);
++    io_hdr.dxferp = rcBuff;
++    io_hdr.cmdp = rc16CmdBlk;
++    io_hdr.sbp = sense_buffer;
++
++    if (ioctl(sg_fd, SG_IO, &io_hdr) < 0) {
++        perror("sg_ststat: STREAM STATUS SG_IO ioctl error");
++        close(sg_fd);
++        return 1;
++    }
++
++    /* now for the error processing */
++    ok = 0;
++    switch (sg_err_category3(&io_hdr)) {
++    case SG_LIB_CAT_CLEAN:
++        ok = 1;
++        break;
++    case SG_LIB_CAT_UNIT_ATTENTION:
++        printf("Unit attention error on STREAM_STATUS, continuing anyway\n");
++        ok = 1;
++        break;
++    case SG_LIB_CAT_RECOVERED:
++        printf("Recovered error on STREAM_STATUS, continuing\n");
++        ok = 1;
++        break;
++    default: /* won't bother decoding other categories */
++        sg_chk_n_print3("STREAM_STATUS command error", &io_hdr, 1);
++        break;
++    }
++
++    if (ok) { /* output result if it is available */
++       printf("STREAM_STATUS duration=%u millisecs, resid=%d, msg_status=%d\n",
++               io_hdr.duration, io_hdr.resid, (int)io_hdr.msg_status);
++       printf("   Number of open stream:  %u\n", rcBuff[6]<<8 | rcBuff[7]);
++       printf("   Received Buff: ");
++       for (k=0; k<(int) alloc_len; k++) {
++	    if ((k%8) == 0)
++       		printf("\n");
++            printf(" %.2x", rcBuff[k]);
++       }	
++       printf("\n");
++    }
++
++    close(sg_fd);
++    return 0;
++}
+-- 
+2.7.4
+

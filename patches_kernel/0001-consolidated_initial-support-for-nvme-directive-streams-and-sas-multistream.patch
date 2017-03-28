@@ -1,0 +1,791 @@
+From 5e83e9be9a6d0cd4072e5d5dec4b08b8c2b1c25a Mon Sep 17 00:00:00 2001
+From: "Kwan (Hingkwan) Huen-SSI" <kwan.huen@samsung.com>
+Date: Thu, 19 Jan 2017 00:34:53 -0800
+Subject: [PATCH] initial support for nvme directive streams and sas
+ multi-stream
+
+---
+ block/bio.c                  |  3 +-
+ block/blk-core.c             |  2 ++
+ drivers/nvme/host/core.c     | 42 +++++++++++++++++++++++++++
+ drivers/nvme/host/nvme.h     |  1 +
+ drivers/nvme/target/io-cmd.c |  4 +++
+ drivers/scsi/sd.c            | 44 +++++++++++++++++++++++------
+ fs/btrfs/extent_io.c         |  1 +
+ fs/btrfs/inode.c             |  2 +-
+ fs/buffer.c                  | 17 +++++++----
+ fs/direct-io.c               |  3 ++
+ fs/ext4/page-io.c            |  1 +
+ fs/inode.c                   |  1 +
+ fs/mpage.c                   |  1 +
+ fs/open.c                    |  1 +
+ fs/xfs/xfs_aops.c            |  3 +-
+ include/linux/blk_types.h    | 11 ++++++++
+ include/linux/fs.h           | 14 +++++++++
+ include/linux/nvme.h         | 35 +++++++++++++++++++++++
+ include/scsi/scsi_proto.h    |  5 ++++
+ include/uapi/linux/fadvise.h |  7 +++++
+ mm/fadvise.c                 | 67 ++++++++++++++++++++++++++++++++++++++++++++
+ 21 files changed, 248 insertions(+), 17 deletions(-)
+
+diff --git a/block/bio.c b/block/bio.c
+index db85c57..dc0d0cc 100644
+--- a/block/bio.c
++++ b/block/bio.c
+@@ -585,6 +585,7 @@ void __bio_clone_fast(struct bio *bio, struct bio *bio_src)
+ 	bio->bi_io_vec = bio_src->bi_io_vec;
+ 
+ 	bio_clone_blkcg_association(bio, bio_src);
++	bio_set_streamid(bio, bio_get_streamid(bio_src));
+ }
+ EXPORT_SYMBOL(__bio_clone_fast);
+ 
+@@ -691,7 +692,7 @@ struct bio *bio_clone_bioset(struct bio *bio_src, gfp_t gfp_mask,
+ 	}
+ 
+ 	bio_clone_blkcg_association(bio, bio_src);
+-
++	bio_set_streamid(bio, bio_get_streamid(bio_src));
+ 	return bio;
+ }
+ EXPORT_SYMBOL(bio_clone_bioset);
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 14d7c07..c069572 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -2034,6 +2034,8 @@ blk_qc_t generic_make_request(struct bio *bio)
+ 	current->bio_list = &bio_list_on_stack;
+ 	do {
+ 		struct request_queue *q = bdev_get_queue(bio->bi_bdev);
++		if (bio_data_dir(bio) == WRITE)
++			blk_add_trace_msg(q, "StreamID=%u", bio_get_streamid(bio));
+ 
+ 		if (likely(blk_queue_enter(q, false) == 0)) {
+ 			ret = q->make_request_fn(q, bio);
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index 79e679d..ee6d526 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -28,6 +28,7 @@
+ #include <linux/t10-pi.h>
+ #include <scsi/sg.h>
+ #include <asm/unaligned.h>
++#include <trace/events/block.h>
+ 
+ #include "nvme.h"
+ #include "fabrics.h"
+@@ -284,6 +285,7 @@ static inline void nvme_setup_rw(struct nvme_ns *ns, struct request *req,
+ {
+ 	u16 control = 0;
+ 	u32 dsmgmt = 0;
++	u16 dspec = bio_get_streamid(req->bio);
+ 
+ 	if (req->cmd_flags & REQ_FUA)
+ 		control |= NVME_RW_FUA;
+@@ -293,6 +295,11 @@ static inline void nvme_setup_rw(struct nvme_ns *ns, struct request *req,
+ 	if (req->cmd_flags & REQ_RAHEAD)
+ 		dsmgmt |= NVME_RW_DSM_FREQ_PREFETCH;
+ 
++	if (rq_data_dir(req) && dspec) {
++		control |= NVME_RW_DTYPE_STREAMS;
++		dsmgmt  |= dspec << 16;
++	}
++
+ 	memset(cmnd, 0, sizeof(*cmnd));
+ 	cmnd->rw.opcode = (rq_data_dir(req) ? nvme_cmd_write : nvme_cmd_read);
+ 	cmnd->rw.command_id = req->tag;
+@@ -319,6 +326,10 @@ static inline void nvme_setup_rw(struct nvme_ns *ns, struct request *req,
+ 
+ 	cmnd->rw.control = cpu_to_le16(control);
+ 	cmnd->rw.dsmgmt = cpu_to_le32(dsmgmt);
++	if (rq_data_dir(req))
++		blk_add_trace_msg(ns->queue, "off:%lld; len:%d; dtype:%d; dspec:%d; nsid:%d",
++			cmnd->rw.slba, cmnd->rw.length+1, control>>4, dspec, cmnd->rw.nsid);
++
+ }
+ 
+ int nvme_setup_cmd(struct nvme_ns *ns, struct request *req,
+@@ -567,6 +578,19 @@ int nvme_identify_ctrl(struct nvme_ctrl *dev, struct nvme_id_ctrl **id)
+ 	return error;
+ }
+ 
++int nvme_enable_directive(struct nvme_ctrl *dev, unsigned nsid, unsigned dir)
++{
++	struct nvme_command c = { };
++	c.directive.opcode = nvme_admin_directive_send;
++	c.directive.nsid = cpu_to_le32(nsid);
++	c.directive.doper = NVME_DIR_SND_ID_OP_ENABLE;
++	c.directive.dtype = NVME_DIR_IDENTIFY;
++	c.directive.tdtype = dir;
++	c.directive.endir = NVME_DIR_ENDIR;
++
++	return nvme_submit_sync_cmd(dev->admin_q, &c, NULL, 0);
++}
++
+ static int nvme_identify_ns_list(struct nvme_ctrl *dev, unsigned nsid, __le32 *ns_list)
+ {
+ 	struct nvme_command c = { };
+@@ -730,6 +754,10 @@ static int nvme_submit_io(struct nvme_ns *ns, struct nvme_user_io __user *uio)
+ 	c.rw.reftag = cpu_to_le32(io.reftag);
+ 	c.rw.apptag = cpu_to_le16(io.apptag);
+ 	c.rw.appmask = cpu_to_le16(io.appmask);
++	if (io.opcode == nvme_cmd_write)
++		blk_add_trace_msg(ns->queue, "off:%lld; len:%d; dtype:%d; dspec:%d; nsid:%d",
++			c.rw.slba, c.rw.length+1, c.rw.control>>4, c.rw.dsmgmt>>16, c.rw.nsid);
++
+ 
+ 	return __nvme_submit_user_cmd(ns->queue, &c,
+ 			(void __user *)(uintptr_t)io.addr, length,
+@@ -763,6 +791,11 @@ static int nvme_user_cmd(struct nvme_ctrl *ctrl, struct nvme_ns *ns,
+ 	c.common.cdw10[3] = cpu_to_le32(cmd.cdw13);
+ 	c.common.cdw10[4] = cpu_to_le32(cmd.cdw14);
+ 	c.common.cdw10[5] = cpu_to_le32(cmd.cdw15);
++/*
++	printk(KERN_INFO "%s:%d opcode:%#x; cdw10:%#x; cdw11:%#x; cdw12:%#x; ns:%#x\n",
++			__func__, __LINE__,
++			cmd.opcode, cmd.cdw10, cmd.cdw11, cmd.cdw12, cmd.nsid);
++*/
+ 
+ 	if (cmd.timeout_ms)
+ 		timeout = msecs_to_jiffies(cmd.timeout_ms);
+@@ -1253,6 +1286,15 @@ int nvme_init_identify(struct nvme_ctrl *ctrl)
+ 
+ 	ctrl->vid = le16_to_cpu(id->vid);
+ 	ctrl->oncs = le16_to_cpup(&id->oncs);
++	ctrl->oacs = le16_to_cpup(&id->oacs);
++	if (ctrl->oacs & NVME_CTRL_OACS_DIRECTIVE) {
++		ret = nvme_enable_directive(ctrl, 0xffffffff, NVME_DIR_STREAMS);
++		if (ret)
++			dev_err(ctrl->device, "Enabling streams directive failed (%d)\n", ret);
++		else
++			dev_info(ctrl->device, "Streams directive enabled.\n");
++		ret = 0;
++	}
+ 	atomic_set(&ctrl->abort_limit, id->acl + 1);
+ 	ctrl->vwc = id->vwc;
+ 	ctrl->cntlid = le16_to_cpup(&id->cntlid);
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index d47f5a5..fa4363d 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -123,6 +123,7 @@ struct nvme_ctrl {
+ 	u32 max_hw_sectors;
+ 	u32 stripe_size;
+ 	u16 oncs;
++	u16 oacs;
+ 	u16 vid;
+ 	atomic_t abort_limit;
+ 	u8 event_limit;
+diff --git a/drivers/nvme/target/io-cmd.c b/drivers/nvme/target/io-cmd.c
+index 4a96c20..8bc52fd 100644
+--- a/drivers/nvme/target/io-cmd.c
++++ b/drivers/nvme/target/io-cmd.c
+@@ -74,6 +74,8 @@ static void nvmet_execute_rw(struct nvmet_req *req)
+ 	bio->bi_iter.bi_sector = sector;
+ 	bio->bi_private = req;
+ 	bio->bi_end_io = nvmet_bio_done;
++	if (req->cmd->rw.control & NVME_RW_DTYPE_STREAMS)
++		bio->bi_streamid = req->cmd->rw.dsmgmt >> 16;
+ 	bio_set_op_attrs(bio, op, op_flags);
+ 
+ 	for_each_sg(req->sg, sg, req->sg_cnt, i) {
+@@ -84,6 +86,8 @@ static void nvmet_execute_rw(struct nvmet_req *req)
+ 			bio = bio_alloc(GFP_KERNEL, min(sg_cnt, BIO_MAX_PAGES));
+ 			bio->bi_bdev = req->ns->bdev;
+ 			bio->bi_iter.bi_sector = sector;
++			if (req->cmd->rw.control & NVME_RW_DTYPE_STREAMS)
++				bio->bi_streamid = req->cmd->rw.dsmgmt >> 16;
+ 			bio_set_op_attrs(bio, op, op_flags);
+ 
+ 			bio_chain(bio, prev);
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index 51e5629..8751563 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -70,6 +70,8 @@
+ #include "scsi_priv.h"
+ #include "scsi_logging.h"
+ 
++#include <trace/events/block.h>
++
+ MODULE_AUTHOR("Eric Youngdale");
+ MODULE_DESCRIPTION("SCSI disk (sd) driver");
+ MODULE_LICENSE("GPL");
+@@ -908,6 +910,7 @@ static int sd_setup_read_write_cmnd(struct scsi_cmnd *SCpnt)
+ 	unsigned int dif, dix;
+ 	int ret;
+ 	unsigned char protect;
++	unsigned short str_id = 0;
+ 
+ 	ret = scsi_init_io(SCpnt);
+ 	if (ret != BLKPREP_OK)
+@@ -960,7 +963,7 @@ static int sd_setup_read_write_cmnd(struct scsi_cmnd *SCpnt)
+ 		}
+ 	}
+ 
+-	SCSI_LOG_HLQUEUE(2, scmd_printk(KERN_INFO, SCpnt, "block=%llu\n",
++	SCSI_LOG_HLQUEUE(3, scmd_printk(KERN_INFO, SCpnt, "block=%llu\n",
+ 					(unsigned long long)block));
+ 
+ 	/*
+@@ -1009,6 +1012,7 @@ static int sd_setup_read_write_cmnd(struct scsi_cmnd *SCpnt)
+ 
+ 		if (blk_integrity_rq(rq))
+ 			sd_dif_prepare(SCpnt);
++		str_id = bio_get_streamid(rq->bio);
+ 
+ 	} else if (rq_data_dir(rq) == READ) {
+ 		SCpnt->cmnd[0] = READ_6;
+@@ -1019,10 +1023,14 @@ static int sd_setup_read_write_cmnd(struct scsi_cmnd *SCpnt)
+ 	}
+ 
+ 	SCSI_LOG_HLQUEUE(2, scmd_printk(KERN_INFO, SCpnt,
+-					"%s %d/%u 512 byte blocks.\n",
+-					(rq_data_dir(rq) == WRITE) ?
+-					"writing" : "reading", this_count,
+-					blk_rq_sectors(rq)));
++				"%s block: %llu, count: %d/%u, stream_id: %u\n",
++				(rq_data_dir(rq) == WRITE) ? "writing" : "reading",
++				(unsigned long long)block, this_count,
++				blk_rq_sectors(rq), str_id));
++
++	if (rq_data_dir(rq))
++		blk_add_trace_msg(rq->q, "off:%llu; len:%d; sid:%d",
++			(unsigned long long) block, this_count, str_id);
+ 
+ 	dix = scsi_prot_sg_count(SCpnt);
+ 	dif = scsi_host_dif_capable(SCpnt->device->host, sdkp->protection_type);
+@@ -1044,7 +1052,19 @@ static int sd_setup_read_write_cmnd(struct scsi_cmnd *SCpnt)
+ 		memset(SCpnt->cmnd, 0, SCpnt->cmd_len);
+ 		SCpnt->cmnd[0] = VARIABLE_LENGTH_CMD;
+ 		SCpnt->cmnd[7] = 0x18;
+-		SCpnt->cmnd[9] = (rq_data_dir(rq) == READ) ? READ_32 : WRITE_32;
++		if (rq_data_dir(rq) == READ) {
++			SCpnt->cmnd[9] = READ_32;
++		}
++		else {
++			if (str_id) {
++				SCpnt->cmnd[4] = (unsigned char) (str_id >> 8) & 0xff;
++				SCpnt->cmnd[5] = (unsigned char) str_id & 0xff;
++				SCpnt->cmnd[9] = WRITE_STREAM_32;
++			}
++			else
++				SCpnt->cmnd[9] = WRITE_32;
++		}
++
+ 		SCpnt->cmnd[10] = protect | ((rq->cmd_flags & REQ_FUA) ? 0x8 : 0);
+ 
+ 		/* LBA */
+@@ -1068,7 +1088,7 @@ static int sd_setup_read_write_cmnd(struct scsi_cmnd *SCpnt)
+ 		SCpnt->cmnd[29] = (unsigned char) (this_count >> 16) & 0xff;
+ 		SCpnt->cmnd[30] = (unsigned char) (this_count >> 8) & 0xff;
+ 		SCpnt->cmnd[31] = (unsigned char) this_count & 0xff;
+-	} else if (sdp->use_16_for_rw || (this_count > 0xffff)) {
++	} else if (sdp->use_16_for_rw || (this_count > 0xffff) || str_id) {
+ 		SCpnt->cmnd[0] += READ_16 - READ_6;
+ 		SCpnt->cmnd[1] = protect | ((rq->cmd_flags & REQ_FUA) ? 0x8 : 0);
+ 		SCpnt->cmnd[2] = sizeof(block) > 4 ? (unsigned char) (block >> 56) & 0xff : 0;
+@@ -1084,6 +1104,11 @@ static int sd_setup_read_write_cmnd(struct scsi_cmnd *SCpnt)
+ 		SCpnt->cmnd[12] = (unsigned char) (this_count >> 8) & 0xff;
+ 		SCpnt->cmnd[13] = (unsigned char) this_count & 0xff;
+ 		SCpnt->cmnd[14] = SCpnt->cmnd[15] = 0;
++		if (str_id && (this_count <= 0xffff)) {
++			SCpnt->cmnd[0] = WRITE_STREAM_16;
++			SCpnt->cmnd[10] = (unsigned char) (str_id >> 8) & 0xff;
++			SCpnt->cmnd[11] = (unsigned char) str_id & 0xff;
++		}
+ 	} else if ((this_count > 0xff) || (block > 0x1fffff) ||
+ 		   scsi_device_protection(SCpnt->device) ||
+ 		   SCpnt->device->use_10_for_rw) {
+@@ -2697,7 +2722,10 @@ static void sd_read_block_limits(struct scsi_disk *sdkp)
+ 				sd_config_discard(sdkp, SD_LBP_WS16);
+ 
+ 		} else {	/* LBP VPD page tells us what to use */
+-			if (sdkp->lbpu && sdkp->max_unmap_blocks && !sdkp->lbprz)
++			/*if (sdkp->lbpu && sdkp->max_unmap_blocks && !sdkp->lbprz)*/
++			/* --hkh: prefer unmap instead of ws16 to speed up trim */
++			/*        for test purpose only, revert back to original when release */
++			if (sdkp->lbpu && sdkp->max_unmap_blocks)
+ 				sd_config_discard(sdkp, SD_LBP_UNMAP);
+ 			else if (sdkp->lbpws)
+ 				sd_config_discard(sdkp, SD_LBP_WS16);
+diff --git a/fs/btrfs/extent_io.c b/fs/btrfs/extent_io.c
+index 8ed05d9..8992c5d 100644
+--- a/fs/btrfs/extent_io.c
++++ b/fs/btrfs/extent_io.c
+@@ -2811,6 +2811,7 @@ static int submit_extent_page(int op, int op_flags, struct extent_io_tree *tree,
+ 	bio->bi_end_io = end_io_func;
+ 	bio->bi_private = tree;
+ 	bio_set_op_attrs(bio, op, op_flags);
++	bio_set_streamid(bio, inode_streamid(page->mapping->host));
+ 	if (wbc) {
+ 		wbc_init_bio(wbc, bio);
+ 		wbc_account_io(wbc, page, page_size);
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index 8e3a5a2..eeb4af4 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -8547,7 +8547,7 @@ static void btrfs_submit_direct(struct bio *dio_bio, struct inode *inode,
+ 	atomic_set(&dip->pending_bios, 0);
+ 	btrfs_bio = btrfs_io_bio(io_bio);
+ 	btrfs_bio->logical = file_offset;
+-
++	bio_set_streamid(io_bio, inode_streamid(inode));
+ 	if (write) {
+ 		io_bio->bi_end_io = btrfs_endio_direct_write;
+ 	} else {
+diff --git a/fs/buffer.c b/fs/buffer.c
+index b205a62..5da5d950 100644
+--- a/fs/buffer.c
++++ b/fs/buffer.c
+@@ -48,7 +48,8 @@
+ static int fsync_buffers_list(spinlock_t *lock, struct list_head *list);
+ static int submit_bh_wbc(int op, int op_flags, struct buffer_head *bh,
+ 			 unsigned long bio_flags,
+-			 struct writeback_control *wbc);
++			 struct writeback_control *wbc,
++			 unsigned short sid);
+ 
+ #define BH_ENTRY(list) list_entry((list), struct buffer_head, b_assoc_buffers)
+ 
+@@ -1786,7 +1787,8 @@ int __block_write_full_page(struct inode *inode, struct page *page,
+ 	do {
+ 		struct buffer_head *next = bh->b_this_page;
+ 		if (buffer_async_write(bh)) {
+-			submit_bh_wbc(REQ_OP_WRITE, write_flags, bh, 0, wbc);
++			submit_bh_wbc(REQ_OP_WRITE, write_flags, bh, 0, wbc,
++					inode_streamid(inode));
+ 			nr_underway++;
+ 		}
+ 		bh = next;
+@@ -1840,7 +1842,8 @@ int __block_write_full_page(struct inode *inode, struct page *page,
+ 		struct buffer_head *next = bh->b_this_page;
+ 		if (buffer_async_write(bh)) {
+ 			clear_buffer_dirty(bh);
+-			submit_bh_wbc(REQ_OP_WRITE, write_flags, bh, 0, wbc);
++			submit_bh_wbc(REQ_OP_WRITE, write_flags, bh, 0, wbc,
++					inode_streamid(inode));
+ 			nr_underway++;
+ 		}
+ 		bh = next;
+@@ -3052,7 +3055,8 @@ void guard_bio_eod(int op, struct bio *bio)
+ }
+ 
+ static int submit_bh_wbc(int op, int op_flags, struct buffer_head *bh,
+-			 unsigned long bio_flags, struct writeback_control *wbc)
++			 unsigned long bio_flags, struct writeback_control *wbc,
++			 unsigned short sid)
+ {
+ 	struct bio *bio;
+ 
+@@ -3088,6 +3092,7 @@ static int submit_bh_wbc(int op, int op_flags, struct buffer_head *bh,
+ 	bio->bi_end_io = end_bio_bh_io_sync;
+ 	bio->bi_private = bh;
+ 	bio->bi_flags |= bio_flags;
++	bio->bi_streamid = sid;
+ 
+ 	/* Take care of bh's that straddle the end of the device */
+ 	guard_bio_eod(op, bio);
+@@ -3105,13 +3110,13 @@ static int submit_bh_wbc(int op, int op_flags, struct buffer_head *bh,
+ int _submit_bh(int op, int op_flags, struct buffer_head *bh,
+ 	       unsigned long bio_flags)
+ {
+-	return submit_bh_wbc(op, op_flags, bh, bio_flags, NULL);
++	return submit_bh_wbc(op, op_flags, bh, bio_flags, NULL, 0);
+ }
+ EXPORT_SYMBOL_GPL(_submit_bh);
+ 
+ int submit_bh(int op, int op_flags,  struct buffer_head *bh)
+ {
+-	return submit_bh_wbc(op, op_flags, bh, 0, NULL);
++	return submit_bh_wbc(op, op_flags, bh, 0, NULL, 0);
+ }
+ EXPORT_SYMBOL(submit_bh);
+ 
+diff --git a/fs/direct-io.c b/fs/direct-io.c
+index fb9aa16..481332b 100644
+--- a/fs/direct-io.c
++++ b/fs/direct-io.c
+@@ -76,6 +76,7 @@ struct dio_submit {
+ 	int reap_counter;		/* rate limit reaping */
+ 	sector_t final_block_in_request;/* doesn't change */
+ 	int boundary;			/* prev block is at a boundary */
++	int streamid;                   /* Write stream ID */
+ 	get_block_t *get_block;		/* block mapping function */
+ 	dio_submit_t *submit_io;	/* IO submition function */
+ 
+@@ -388,6 +389,7 @@ dio_bio_alloc(struct dio *dio, struct dio_submit *sdio,
+ 
+ 	sdio->bio = bio;
+ 	sdio->logical_offset_in_bio = sdio->cur_page_fs_offset;
++	bio_set_streamid(bio, sdio->streamid);
+ }
+ 
+ /*
+@@ -1242,6 +1244,7 @@ do_blockdev_direct_IO(struct kiocb *iocb, struct inode *inode,
+ 	sdio.blkbits = blkbits;
+ 	sdio.blkfactor = i_blkbits - blkbits;
+ 	sdio.block_in_file = offset >> blkbits;
++	sdio.streamid = file_streamid(iocb->ki_filp);
+ 
+ 	sdio.get_block = get_block;
+ 	dio->end_io = end_io;
+diff --git a/fs/ext4/page-io.c b/fs/ext4/page-io.c
+index 0094923..b8738a9 100644
+--- a/fs/ext4/page-io.c
++++ b/fs/ext4/page-io.c
+@@ -388,6 +388,7 @@ static int io_submit_add_bh(struct ext4_io_submit *io,
+ 		ret = io_submit_init_bio(io, bh);
+ 		if (ret)
+ 			return ret;
++		bio_set_streamid(io->io_bio, inode_streamid(inode));
+ 	}
+ 	ret = bio_add_page(io->io_bio, page, bh->b_size, bh_offset(bh));
+ 	if (ret != bh->b_size)
+diff --git a/fs/inode.c b/fs/inode.c
+index bc0fcaf..9bc72dc 100644
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@ -149,6 +149,7 @@ int inode_init_always(struct super_block *sb, struct inode *inode)
+ 	inode->i_blocks = 0;
+ 	inode->i_bytes = 0;
+ 	inode->i_generation = 0;
++	inode->i_streamid = 0;
+ 	inode->i_pipe = NULL;
+ 	inode->i_bdev = NULL;
+ 	inode->i_cdev = NULL;
+diff --git a/fs/mpage.c b/fs/mpage.c
+index d2413af..29046ee 100644
+--- a/fs/mpage.c
++++ b/fs/mpage.c
+@@ -285,6 +285,7 @@ do_mpage_readpage(struct bio *bio, struct page *page, unsigned nr_pages,
+ 				min_t(int, nr_pages, BIO_MAX_PAGES), gfp);
+ 		if (bio == NULL)
+ 			goto confused;
++		bio_set_streamid(bio, inode_streamid(inode));
+ 	}
+ 
+ 	length = first_hole << blkbits;
+diff --git a/fs/open.c b/fs/open.c
+index b7f844e..5e522b0 100644
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -771,6 +771,7 @@ static int do_dentry_open(struct file *f,
+ 	f->f_flags &= ~(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC);
+ 
+ 	file_ra_state_init(&f->f_ra, f->f_mapping->host->i_mapping);
++	f->f_streamid = 0;
+ 
+ 	return 0;
+ 
+diff --git a/fs/xfs/xfs_aops.c b/fs/xfs/xfs_aops.c
+index 2693ba8..58f601a 100644
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@ -508,7 +508,7 @@ xfs_submit_ioend(
+ 		bio_endio(ioend->io_bio);
+ 		return status;
+ 	}
+-
++	bio_set_streamid(ioend->io_bio, ioend->io_inode->i_streamid);
+ 	submit_bio(ioend->io_bio);
+ 	return 0;
+ }
+@@ -569,6 +569,7 @@ xfs_chain_bio(
+ 	bio_get(ioend->io_bio);		/* for xfs_destroy_ioend */
+ 	bio_set_op_attrs(ioend->io_bio, REQ_OP_WRITE,
+ 			  (wbc->sync_mode == WB_SYNC_ALL) ? WRITE_SYNC : 0);
++	bio_set_streamid(ioend->io_bio, ioend->io_inode->i_streamid);
+ 	submit_bio(ioend->io_bio);
+ 	ioend->io_bio = new;
+ }
+diff --git a/include/linux/blk_types.h b/include/linux/blk_types.h
+index cd395ec..7e3dc52 100644
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@ -32,6 +32,7 @@ struct bio {
+ 						 */
+ 	unsigned short		bi_flags;	/* status, command, etc */
+ 	unsigned short		bi_ioprio;
++	unsigned short		bi_streamid;
+ 
+ 	struct bvec_iter	bi_iter;
+ 
+@@ -142,6 +143,16 @@ struct bio {
+ #define BVEC_POOL_OFFSET	(16 - BVEC_POOL_BITS)
+ #define BVEC_POOL_IDX(bio)	((bio)->bi_flags >> BVEC_POOL_OFFSET)
+ 
++static inline void bio_set_streamid(struct bio *bio, unsigned int id)
++{
++	bio->bi_streamid = id;
++}
++
++static inline unsigned int bio_get_streamid(struct bio *bio)
++{
++	return bio->bi_streamid;
++}
++
+ #endif /* CONFIG_BLOCK */
+ 
+ /*
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 8675702..3dd89da 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -679,6 +679,7 @@ struct inode {
+ #ifdef CONFIG_IMA
+ 	atomic_t		i_readcount; /* struct files open RO */
+ #endif
++	unsigned int		i_streamid;
+ 	const struct file_operations	*i_fop;	/* former ->i_op->default_file_ops */
+ 	struct file_lock_context	*i_flctx;
+ 	struct address_space	i_data;
+@@ -705,6 +706,13 @@ struct inode {
+ 	void			*i_private; /* fs or device private pointer */
+ };
+ 
++static inline unsigned int inode_streamid(struct inode *inode)
++{
++	if (inode)
++		return inode->i_streamid;
++	return 0;
++}
++
+ static inline int inode_unhashed(struct inode *inode)
+ {
+ 	return hlist_unhashed(&inode->i_hash);
+@@ -891,6 +899,7 @@ struct file {
+ 	 * Must not be taken from IRQ context.
+ 	 */
+ 	spinlock_t		f_lock;
++	unsigned int		f_streamid;
+ 	atomic_long_t		f_count;
+ 	unsigned int 		f_flags;
+ 	fmode_t			f_mode;
+@@ -922,6 +931,11 @@ struct file_handle {
+ 	unsigned char f_handle[0];
+ };
+ 
++static inline unsigned int file_streamid(struct file *f)
++{
++	return f->f_streamid; /* 0 is also a valid stream */
++}
++
+ static inline struct file *get_file(struct file *f)
+ {
+ 	atomic_long_inc(&f->f_count);
+diff --git a/include/linux/nvme.h b/include/linux/nvme.h
+index e5c8268..bfe658a 100644
+--- a/include/linux/nvme.h
++++ b/include/linux/nvme.h
+@@ -242,6 +242,7 @@ enum {
+ 	NVME_CTRL_ONCS_COMPARE			= 1 << 0,
+ 	NVME_CTRL_ONCS_WRITE_UNCORRECTABLE	= 1 << 1,
+ 	NVME_CTRL_ONCS_DSM			= 1 << 2,
++	NVME_CTRL_OACS_DIRECTIVE		= 1 << 5,
+ 	NVME_CTRL_VWC_PRESENT			= 1 << 0,
+ };
+ 
+@@ -292,6 +293,19 @@ enum {
+ };
+ 
+ enum {
++	NVME_DIR_IDENTIFY		= 0x00,
++	NVME_DIR_STREAMS		= 0x01,
++        NVME_DIR_SND_ID_OP_ENABLE	= 0x01,
++        NVME_DIR_SND_ST_OP_REL_ID	= 0x01,
++        NVME_DIR_SND_ST_OP_REL_RSC	= 0x02,
++        NVME_DIR_RCV_ID_OP_PARAM	= 0x01,
++        NVME_DIR_RCV_ST_OP_PARAM	= 0x01,
++        NVME_DIR_RCV_ST_OP_STATUS	= 0x02,
++        NVME_DIR_RCV_ST_OP_RESOURCE	= 0x03,
++	NVME_DIR_ENDIR			= 0x01,
++};
++
++enum {
+ 	NVME_NS_FEAT_THIN	= 1 << 0,
+ 	NVME_NS_FLBAS_LBA_MASK	= 0xf,
+ 	NVME_NS_FLBAS_META_EXT	= 0x10,
+@@ -532,6 +546,7 @@ enum {
+ 	NVME_RW_PRINFO_PRCHK_APP	= 1 << 11,
+ 	NVME_RW_PRINFO_PRCHK_GUARD	= 1 << 12,
+ 	NVME_RW_PRINFO_PRACT		= 1 << 13,
++	NVME_RW_DTYPE_STREAMS		= 1 << 4,
+ };
+ 
+ struct nvme_dsm_cmd {
+@@ -576,6 +591,8 @@ enum nvme_admin_opcode {
+ 	nvme_admin_download_fw		= 0x11,
+ 	nvme_admin_ns_attach		= 0x15,
+ 	nvme_admin_keep_alive		= 0x18,
++	nvme_admin_directive_send       = 0x19,
++	nvme_admin_directive_recv       = 0x1a,
+ 	nvme_admin_format_nvm		= 0x80,
+ 	nvme_admin_security_send	= 0x81,
+ 	nvme_admin_security_recv	= 0x82,
+@@ -728,6 +745,23 @@ struct nvme_get_log_page_command {
+ 	__u32			rsvd14[2];
+ };
+ 
++struct nvme_directive_cmd {
++	__u8			opcode;
++	__u8			flags;
++	__u16			command_id;
++	__le32			nsid;
++	__u64			rsvd2[2];
++	union nvme_data_ptr	dptr;
++	__le32			numd;
++	__u8			doper;
++	__u8			dtype;
++	__le16			dspec;
++	__u8			endir;
++	__u8			tdtype;
++	__u16			rsvd15;
++	__u32			rsvd16[3];
++};
++
+ /*
+  * Fabrics subcommands.
+  */
+@@ -877,6 +911,7 @@ struct nvme_command {
+ 		struct nvme_doorbell_memory doorbell_memory;
+ #endif
+ 		struct nvme_get_log_page_command get_log_page;
++		struct nvme_directive_cmd directive;
+ 		struct nvmf_common_command fabrics;
+ 		struct nvmf_connect_command connect;
+ 		struct nvmf_property_set_command prop_set;
+diff --git a/include/scsi/scsi_proto.h b/include/scsi/scsi_proto.h
+index d1defd1..9297de9 100644
+--- a/include/scsi/scsi_proto.h
++++ b/include/scsi/scsi_proto.h
+@@ -115,6 +115,7 @@
+ #define VERIFY_16	      0x8f
+ #define SYNCHRONIZE_CACHE_16  0x91
+ #define WRITE_SAME_16	      0x93
++#define WRITE_STREAM_16       0x9a
+ #define ZBC_OUT		      0x94
+ #define ZBC_IN		      0x95
+ #define SERVICE_ACTION_BIDIRECTIONAL 0x9d
+@@ -124,6 +125,9 @@
+ #define	SAI_READ_CAPACITY_16  0x10
+ #define SAI_GET_LBA_STATUS    0x12
+ #define SAI_REPORT_REFERRALS  0x13
++#define SAI_STREAM_CONTROL    0x14
++#define SAI_BACKGROUND_CONTROL    0x15
++#define SAI_GET_STREAM_STATUS     0x16
+ /* values for VARIABLE_LENGTH_CMD service action codes
+  * see spc4r17 Section D.3.5, table D.7 and D.8 */
+ #define VLC_SA_RECEIVE_CREDENTIAL 0x1800
+@@ -161,6 +165,7 @@
+ #define VERIFY_32	      0x0a
+ #define WRITE_32	      0x0b
+ #define WRITE_SAME_32	      0x0d
++#define WRITE_STREAM_32       0x10
+ 
+ /* Values for T10/04-262r7 */
+ #define	ATA_16		      0x85	/* 16-byte pass-thru */
+diff --git a/include/uapi/linux/fadvise.h b/include/uapi/linux/fadvise.h
+index e8e7471..fd57a95 100644
+--- a/include/uapi/linux/fadvise.h
++++ b/include/uapi/linux/fadvise.h
+@@ -18,4 +18,11 @@
+ #define POSIX_FADV_NOREUSE	5 /* Data will be accessed once.  */
+ #endif
+ 
++#define POSIX_FADV_STREAM_ASSIGN    0xa /* allocate a stream */
++#define POSIX_FADV_STREAM_RELEASE   0xb /* release a stream */
++#define POSIX_FADV_STREAM_GET     0xc /* get current stream */
++
++#define STREAM_F_INODE  1 /* associate stream ID with inode */
++#define STREAM_F_FILE   2 /* associate stream ID with file */
++
+ #endif	/* FADVISE_H_INCLUDED */
+diff --git a/mm/fadvise.c b/mm/fadvise.c
+index 6c707bf..96050ff 100644
+--- a/mm/fadvise.c
++++ b/mm/fadvise.c
+@@ -60,6 +60,9 @@ SYSCALL_DEFINE4(fadvise64_64, int, fd, loff_t, offset, loff_t, len, int, advice)
+ 		case POSIX_FADV_WILLNEED:
+ 		case POSIX_FADV_NOREUSE:
+ 		case POSIX_FADV_DONTNEED:
++		case POSIX_FADV_STREAM_ASSIGN:
++		case POSIX_FADV_STREAM_RELEASE:
++		case POSIX_FADV_STREAM_GET:
+ 			/* no bad return value, but ignore advice */
+ 			break;
+ 		default:
+@@ -155,6 +158,70 @@ SYSCALL_DEFINE4(fadvise64_64, int, fd, loff_t, offset, loff_t, len, int, advice)
+ 			}
+ 		}
+ 		break;
++	case POSIX_FADV_STREAM_ASSIGN:
++		/*
++		 * id is assigned in either file or inode indicated by len.
++		 * stream id is within 16-bit limits. 1 is the lowest valid
++		 * stream id, 0 is "normal write".
++		 * stream management is via bdi, if underlying
++		 * block device supports it.
++		 * TODO: get id from bdi
++		 *       assigned id with value in offset for testing now
++		 */
++		if (offset != (unsigned short) offset) {
++			ret = -EINVAL;
++			break;
++		}
++		if (len & ~(STREAM_F_FILE | STREAM_F_INODE)) {
++			ret = -EINVAL;
++			break;
++		}
++		if (len & STREAM_F_FILE) {
++			f.file->f_streamid = offset;
++		}
++		if (len & STREAM_F_INODE) {
++			spin_lock(&inode->i_lock);
++			inode->i_streamid = offset;
++			spin_unlock(&inode->i_lock);
++		}
++		break;
++	case POSIX_FADV_STREAM_RELEASE:
++		/*
++		 * stream management is via bdi, if underlying
++		 * block device supports it.
++		 * TODO: release id via bdi
++		 */
++		if (len & ~(STREAM_F_FILE | STREAM_F_INODE)) {
++			ret = -EINVAL;
++			break;
++		}
++		if (len & STREAM_F_FILE) {
++			f.file->f_streamid = 0;
++		}
++		else if (len & STREAM_F_INODE) {
++			spin_lock(&inode->i_lock);
++			inode->i_streamid = 0;
++			spin_unlock(&inode->i_lock);
++		}
++		else
++			return -EINVAL;
++		break;
++	case POSIX_FADV_STREAM_GET:
++		if (len & ~(STREAM_F_FILE | STREAM_F_INODE)) {
++			ret = -EINVAL;
++			break;
++		}
++		if (len & STREAM_F_FILE) {
++			ret = f.file->f_streamid;
++		}
++		else if (len & STREAM_F_INODE) {
++			spin_lock(&inode->i_lock);
++			ret = inode->i_streamid;
++			spin_unlock(&inode->i_lock);
++		}
++		else
++			return -EINVAL;
++		break;
+ 	default:
+ 		ret = -EINVAL;
+ 	}
+-- 
+2.7.4
+

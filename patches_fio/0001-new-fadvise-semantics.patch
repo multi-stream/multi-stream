@@ -1,0 +1,58 @@
+From 2a80e4a76552230e948087ea48413891f116cd5c Mon Sep 17 00:00:00 2001
+From: "Kwan (Hingkwan) Huen-SSI" <kwan.huen@samsung.com>
+Date: Thu, 19 Jan 2017 13:24:28 -0800
+Subject: [PATCH] new fadvise semantics
+
+---
+ ioengines.c   |  3 ++-
+ os/os-linux.h | 20 ++++++++++++++++++--
+ 2 files changed, 20 insertions(+), 3 deletions(-)
+
+diff --git a/ioengines.c b/ioengines.c
+index a1f8756..6955107 100644
+--- a/ioengines.c
++++ b/ioengines.c
+@@ -477,7 +477,8 @@ int td_io_open_file(struct thread_data *td, struct fio_file *f)
+ 	    (f->filetype == FIO_TYPE_BD || f->filetype == FIO_TYPE_FILE)) {
+ 		off_t stream = td->o.fadvise_stream;
+ 
+-		if (posix_fadvise(f->fd, stream, f->io_size, POSIX_FADV_STREAMID) < 0) {
++		if (posix_fadvise(f->fd, stream, STREAM_F_INODE | STREAM_F_FILE, 
++				POSIX_FADV_STREAM_ASSIGN) < 0) {
+ 			td_verror(td, errno, "fadvise streamid");
+ 			goto err;
+ 		}
+diff --git a/os/os-linux.h b/os/os-linux.h
+index 06235ab..38226ca 100644
+--- a/os/os-linux.h
++++ b/os/os-linux.h
+@@ -292,8 +292,24 @@ static inline int fio_set_sched_idle(void)
+ }
+ #endif
+ 
+-#ifndef POSIX_FADV_STREAMID
+-#define POSIX_FADV_STREAMID	8
++#ifndef POSIX_FADV_STREAM_ASSIGN
++#define POSIX_FADV_STREAM_ASSIGN    0xa /* allocate a stream */
++#endif
++
++#ifndef POSIX_FADV_STREAM_RELEASE
++#define POSIX_FADV_STREAM_RELEASE   0xb /* release a stream */
++#endif
++
++#ifndef POSIX_FADV_STREAM_GET
++#define POSIX_FADV_STREAM_GET     0xc /* get current stream */
++#endif
++
++#ifndef STREAM_F_INODE
++#define STREAM_F_INODE  1 /* associate stream ID with inode */
++#endif
++
++#ifndef STREAM_F_FILE
++#define STREAM_F_FILE   2 /* associate stream ID with file */
+ #endif
+ 
+ #define FIO_HAVE_STREAMID
+-- 
+2.7.4
+
